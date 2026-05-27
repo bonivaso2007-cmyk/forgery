@@ -1,0 +1,163 @@
+[
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "google/gemini-2.0-flash-001",
+    "status": "ok",
+    "tokens": 877,
+    "timestamp": "2026-05-26T07:01:09.604Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "google/gemini-2.0-flash-001",
+    "status": "ok",
+    "tokens": 821,
+    "timestamp": "2026-05-26T07:06:32.558Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "google/gemini-2.0-flash-001",
+    "status": "error",
+    "error": "Guest forge limit reached for today. Create an account to unlock more.",
+    "tokens": 821,
+    "timestamp": "2026-05-26T07:09:31.717Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "google/gemini-2.0-flash-001",
+    "status": "ok",
+    "tokens": 821,
+    "timestamp": "2026-05-26T07:10:51.931Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "google/gemini-2.0-flash-001",
+    "status": "ok",
+    "tokens": 821,
+    "timestamp": "2026-05-26T07:13:47.684Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "google/gemini-2.0-flash-001",
+    "status": "error",
+    "error": "Guest forge limit reached for today. Create an account to unlock more.",
+    "tokens": 821,
+    "timestamp": "2026-05-26T07:15:37.339Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "google/gemini-2.0-flash-001",
+    "status": "ok",
+    "tokens": 821,
+    "timestamp": "2026-05-26T07:16:07.130Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "google/gemini-2.0-flash-001",
+    "status": "ok",
+    "tokens": 821,
+    "timestamp": "2026-05-26T07:32:45.268Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "google/gemini-2.0-flash-001",
+    "status": "ok",
+    "tokens": 821,
+    "timestamp": "2026-05-26T08:31:26.355Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "z-ai/glm-4.5-air:free",
+    "status": "ok",
+    "tokens": 648,
+    "timestamp": "2026-05-26T21:18:03.315Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "z-ai/glm-4.5-air:free",
+    "status": "error",
+    "error": "Guest forge limit reached for today. Create an account to unlock more.",
+    "tokens": 847,
+    "timestamp": "2026-05-26T21:18:03.361Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "z-ai/glm-4.5-air:free",
+    "status": "error",
+    "error": "Guest forge limit reached for today. Create an account to unlock more.",
+    "tokens": 847,
+    "timestamp": "2026-05-26T21:18:03.809Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "z-ai/glm-4.5-air:free",
+    "status": "error",
+    "error": "Guest forge limit reached for today. Create an account to unlock more.",
+    "tokens": 847,
+    "timestamp": "2026-05-26T21:18:04.655Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "z-ai/glm-4.5-air:free",
+    "status": "ok",
+    "tokens": 1257,
+    "timestamp": "2026-05-26T21:23:09.127Z"
+  },
+  {
+    "type": "waitlist_join",
+    "email": "bonivaso2007@gmail.com",
+    "stage": "Early idea",
+    "timestamp": "2026-05-26T21:23:22.680Z"
+  },
+  {
+    "type": "generate",
+    "ip": "127.0.0.1",
+    "userId": null,
+    "provider": "openrouter",
+    "model": "z-ai/glm-4.5-air:free",
+    "status": "ok",
+    "tokens": 857,
+    "timestamp": "2026-05-26T21:23:24.736Z"
+  }
+]
