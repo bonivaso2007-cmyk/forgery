@@ -1,73 +1,108 @@
-# React + TypeScript + Vite
+# Forge � Idea Engine
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Forge is a founder-focused idea validation engine built with React, TypeScript, Vite, and an Express backend.
 
-Currently, two official plugins are available:
+This repo contains two related frontends:
+- `src/App.tsx` � the main Forge app with the current onboarding/guest flow and side panels.
+- `src/MVPApp.tsx` � a simpler IGNITE MVP shell for fast idea validation.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## What Forge does
 
-## React Compiler
+Forge turns a raw idea into a rapid validation pass. It is built to:
+- accept one founder idea
+- run a ruthless validation prompt called **IGNITE**
+- return a single score, blunt verdict, strengths, weaknesses, and next moves
+- avoid extra API-key UI in the main user experience
+- keep the flow lean and founder-first
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Architecture
 
-## Expanding the ESLint configuration
+- `server/index.mjs` � Express server that serves the frontend and proxies AI generation requests.
+- `api/forge/generate.js` � serverless-compatible handler for deployments.
+- `src/App.tsx` � main application shell with guest mode, onboarding, profile data, and the Forge engine.
+- `src/MVPApp.tsx` � minimal MVP interface for direct idea ignition.
+- `src/lib/analytics.ts` and `src/lib/supabase.ts` � helper modules for event tracking and optional Supabase identity.
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## Installation
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+cd forge-app
+npm install
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Local development
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+Create a `.env.local` file from `.env.example`, then start the app:
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+# macOS / Linux
+cp .env.example .env.local
+
+# Windows PowerShell
+copy .env.example .env.local
+
+npm run dev
 ```
+
+The app runs at `http://127.0.0.1:3000/` and the backend server is powered by `server/index.mjs`.
+
+## Production
+
+```bash
+npm run build
+npm start
+```
+
+## Deployment
+
+```bash
+npm run deploy
+```
+
+This builds the app and publishes the `dist` folder to GitHub Pages.
+
+## Environment variables
+
+The app uses the following vars in `.env.local`:
+
+- `FORGE_AI_PROVIDER` � default AI provider for server-side generation.
+- `FORGE_AI_MODEL` � default model used by the backend.
+- `FORGE_AI_API_KEY` � provider API key used by the backend.
+- `FORGE_TRUSTED_DOMAINS` � allowed research/trusted domains.
+- `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` � optional Supabase auth.
+- `VITE_POSTHOG_KEY` / `VITE_POSTHOG_HOST` � optional analytics.
+
+> Do not commit `.env.local` or any real API keys.
+
+## Usage
+
+1. Open the app.
+2. Paste a raw idea into the input.
+3. Click **IGNITE**.
+4. Forge returns a score, a blunt verdict, the top risks, and the next validation steps.
+
+## Notes for contributors
+
+- The current live interface is wired through `src/App.tsx`.
+- `src/MVPApp.tsx` is a separate MVP variant for a simpler experience.
+- The backend keeps secrets off the client and proxies provider requests.
+- The design is guest-first and focused on fast founder validation.
+
+## Scripts
+
+- `npm run dev` � start development server
+- `npm run build` � compile and bundle production assets
+- `npm start` � run production server
+- `npm run preview` � preview production build locally
+- `npm run lint` � run ESLint
+- `npm run deploy` � publish `dist` to GitHub Pages
+
+## Troubleshooting
+
+- If the server fails to start, stop any stale `node` processes and retry.
+- If build memory fails, restart the process and rerun `npm run build`.
+- If API calls fail, verify `FORGE_AI_API_KEY` and provider settings in `.env.local`.
+
+## License
+
+This repo is the Forge idea engine project. It is intended as beta startup code for experimentation and rapid founder validation.
