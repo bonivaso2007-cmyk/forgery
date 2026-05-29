@@ -1,4 +1,5 @@
 const DEFAULT_MODEL = 'demo';
+const DEFAULT_HUGGINGFACE_MODEL = 'deepseek/deepseek-v4-pro';
 const DEFAULT_PROVIDER = 'mock';
 const DEFAULT_FORGE_SYSTEM_PROMPT = `You are FORGE, a ruthless founder decision engine.
 Return exactly one JSON object and nothing else. Do not use markdown, bullets, code fences, or extra commentary.
@@ -269,6 +270,44 @@ function isInsufficientCreditsError(message) {
     || text.includes('payment');
 }
 
+function buildHuggingFacePayload({ system, user, maxTokens, temperature }) {
+  return {
+    inputs: `${system}\n\n${user}`,
+    parameters: {
+      max_new_tokens: maxTokens,
+      temperature,
+      return_full_text: false,
+      top_p: 0.95,
+      repetition_penalty: 1.03,
+    },
+  };
+}
+
+function extractTextFromHuggingFace(data) {
+  if (typeof data === 'string') {
+    return data.trim();
+  }
+
+  if (Array.isArray(data) && data.length > 0) {
+    if (typeof data[0].generated_text === 'string') {
+      return data[0].generated_text.trim();
+    }
+    if (typeof data[0].text === 'string') {
+      return data[0].text.trim();
+    }
+  }
+
+  if (typeof data?.generated_text === 'string') {
+    return data.generated_text.trim();
+  }
+
+  if (typeof data?.text === 'string') {
+    return data.text.trim();
+  }
+
+  return '';
+}
+
 function generateMockResponse(payload = {}) {
   return buildFallbackResponse(payload, 'Local demo AI is active because a real provider was unavailable.');
 }
@@ -285,19 +324,70 @@ async function providerRequest(url, options) {
 }
 
 async function generateFromProvider(payload) {
-  const { provider = DEFAULT_PROVIDER, model = DEFAULT_MODEL, apiKey, system = DEFAULT_FORGE_SYSTEM_PROMPT, user, maxTokens = 800, temperature = 0.5, trustedDomains } = payload;
-  const resolvedApiKey = (apiKey || '').trim() || process.env.FORGE_AI_API_KEY?.trim();
+  const {
+    provider = DEFAULT_PROVIDER,
+    model,
+    apiKey,
+    system = DEFAULT_FORGE_SYSTEM_PROMPT,
+    user,
+    maxTokens = 800,
+    temperature = 0.5,
+    trustedDomains,
+  } = payload;
 
-  if (provider === 'mock') {
+  const resolvedProvider = ['mock', 'huggingface', 'openrouter'].includes(provider) ? provider : DEFAULT_PROVIDER;
+  const resolvedModel = model || (resolvedProvider === 'huggingface'
+    ? DEFAULT_HUGGINGFACE_MODEL
+    : 'deepseek/deepseek-v4-flash:free');
+  const resolvedApiKey = (apiKey || '').trim() || process.env.FORGE_AI_API_KEY?.trim();
+  const resolvedTemperature = Number.isFinite(Number(temperature)) ? Number(temperature) : 0.5;
+
+  if (resolvedProvider === 'mock') {
     return generateMockResponse(payload);
   }
 
-  if (!resolvedApiKey) {
-    throw new Error('Missing backend API key. Add FORGE_AI_API_KEY to your env vars.');
+  if (resolvedProvider === 'huggingface') {
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (resolvedApiKey) {
+        headers.Authorization = `Bearer ${resolvedApiKey}`;
+      }
+
+      const data = await providerRequest(
+        `https://api-inference.huggingface.co/models/${encodeURIComponent(resolvedModel)}`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(buildHuggingFacePayload({
+            system,
+            user,
+            maxTokens,
+            temperature: resolvedTemperature,
+          })),
+        }
+      );
+
+      const text = extractTextFromHuggingFace(data);
+      if (text) {
+        return text;
+      }
+
+      return generateMockResponse(payload);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      if (isInsufficientCreditsError(message) || /unauthorized|forbidden|permission|quota|rate limit|not found/.test(message.toLowerCase())) {
+        return generateMockResponse(payload);
+      }
+      throw error;
+    }
   }
 
-  if (provider !== 'openrouter') {
-    throw new Error('This MVP deployment currently supports OpenRouter only.');
+  if (resolvedProvider !== 'openrouter') {
+    throw new Error('This API endpoint currently supports OpenRouter or Hugging Face providers only.');
+  }
+
+  if (!resolvedApiKey) {
+    throw new Error('Missing backend API key. Add FORGE_AI_API_KEY to your env vars, or choose the mock provider.');
   }
 
   try {
@@ -310,11 +400,11 @@ async function generateFromProvider(payload) {
         'X-OpenRouter-Title': 'FORGE MVP',
       },
       body: JSON.stringify(buildOpenRouterPayload({
-        model,
+        model: resolvedModel,
         system,
         user,
         maxTokens,
-        temperature,
+        temperature: resolvedTemperature,
         trustedDomains,
       })),
     });
@@ -336,12 +426,37 @@ export default async function handler(request, response) {
   }
 
   try {
-    const payload = await request.json();
+    const payload = await parseRequestBody(request);
     const text = await generateFromProvider(payload);
     const parsed = parseStructuredResponse(text);
     response.status(200).json(parsed);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown server error';
     response.status(500).json({ error: message });
+  }
+}
+
+async function parseRequestBody(request) {
+  if (typeof request.json === 'function') {
+    return await request.json();
+  }
+
+  if (request.body) {
+    return request.body;
+  }
+
+  let rawBody = '';
+  for await (const chunk of request) {
+    rawBody += chunk instanceof Buffer ? chunk.toString('utf8') : chunk;
+  }
+
+  if (!rawBody) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(rawBody);
+  } catch (error) {
+    return {};
   }
 }

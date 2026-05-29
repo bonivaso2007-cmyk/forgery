@@ -51,7 +51,7 @@ const PROVIDER_DEFAULTS = {
   },
   huggingface: {
     label: 'Hugging Face',
-    model: 'google/flan-t5-large',
+    model: 'deepseek/deepseek-v4-pro',
   },
   gemini: {
     label: 'Google Gemini',
@@ -784,19 +784,20 @@ async function generateFromProvider(payload) {
   }
 
   if (resolvedProvider === 'huggingface') {
-    if (!resolvedApiKey) {
-      return generateMockResponse(payload);
-    }
-
     try {
+      const headers = {
+        'Content-Type': 'application/json',
+      };
+
+      if (resolvedApiKey) {
+        headers.Authorization = `Bearer ${resolvedApiKey}`;
+      }
+
       const data = await providerRequest(
         `https://api-inference.huggingface.co/models/${encodeURIComponent(resolvedModel)}`,
         {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${resolvedApiKey}`,
-          },
+          headers,
           body: JSON.stringify(buildHuggingFacePayload({
             system,
             user,
