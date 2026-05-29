@@ -1220,6 +1220,7 @@ function SidebarNav({ activeView, onNavigate, themePalette, onSignOut, isAuthent
 
   return (
     <div
+      className="sidebar-nav"
       style={{
         position: "sticky",
         top: "1rem",
@@ -1236,6 +1237,7 @@ function SidebarNav({ activeView, onNavigate, themePalette, onSignOut, isAuthent
     >
       <div style={{ display: "grid", gap: "0.5rem" }}>
         <button
+          className="sidebar-toggle"
           onClick={onToggle}
           style={{
             border: `1px solid ${themePalette.border}`,
@@ -1264,6 +1266,7 @@ function SidebarNav({ activeView, onNavigate, themePalette, onSignOut, isAuthent
           const active = activeView === item.key;
           return (
             <button
+              className={`sidebar-item${active ? ' active' : ''}`}
               key={item.key}
               onClick={() => onNavigate(item.key)}
               style={{
@@ -1282,15 +1285,17 @@ function SidebarNav({ activeView, onNavigate, themePalette, onSignOut, isAuthent
                 minHeight: isOpen ? "56px" : "40px",
               }}
               title={item.label}
+              aria-label={item.label}
             >
               <span style={{ fontSize: "1rem", lineHeight: 1 }}>{item.icon}</span>
-              {isOpen && <span style={{ fontSize: "0.5rem", letterSpacing: "0.8px" }}>{item.label}</span>}
+              {isOpen && <span className="sidebar-label" style={{ fontSize: "0.5rem", letterSpacing: "0.8px" }}>{item.label}</span>}
             </button>
           );
         })}
 
         {isAuthenticated && isOpen && (
           <button
+            className="sidebar-logout"
             onClick={onSignOut}
             style={{
               marginTop: "0.35rem",
