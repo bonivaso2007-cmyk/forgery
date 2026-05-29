@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import "./App.css";
 
 const Q_TARGET = 6;
 const LIME = "#C8FF00";
@@ -47,7 +48,7 @@ const PROVIDERS = {
     label: "Hugging Face",
     keyLabel: "Hugging Face API key",
     keyExample: "hf_...",
-    model: "google/flan-t5-large",
+    model: "deepseek/deepseek-v4-pro",
     path: "/api/huggingface/v1",
   },
   openrouter: {
@@ -1571,6 +1572,7 @@ export default function Forge() {
   });
   const [waitlistStatus, setWaitlistStatus] = useState("");
   const [waitlistBusy, setWaitlistBusy] = useState(false);
+  const [serverStatus, setServerStatus] = useState("Checking…");
   const [founderProfile, setFounderProfile] = useState(() => {
     if (typeof window === "undefined") return defaultFounderProfile();
     return safeParse(localStorage.getItem(STORAGE_KEYS.profile), defaultFounderProfile());
@@ -1640,6 +1642,29 @@ export default function Forge() {
     }
 
     hydrateSession();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function checkServerHealth() {
+      try {
+        const res = await fetch("/api/health");
+        if (!cancelled) {
+          setServerStatus(res.ok ? "Live" : "Offline");
+        }
+      } catch {
+        if (!cancelled) {
+          setServerStatus("Offline");
+        }
+      }
+    }
+
+    checkServerHealth();
 
     return () => {
       cancelled = true;
@@ -2130,7 +2155,7 @@ export default function Forge() {
   const cardPadding = compactMode ? "0.85rem" : "1rem";
 
   const G = {
-    app: { minHeight: "100vh", background: themePalette.pageBg, color: themePalette.textPrimary, fontFamily: "monospace", display: "flex", flexDirection: "column", alignItems: "center", padding: "0 1.25rem" },
+    app: { minHeight: "100vh", background: "transparent", color: themePalette.textPrimary, fontFamily: "monospace", display: "flex", flexDirection: "column", alignItems: "center", padding: "0 1.25rem" },
     wrap: { width: "100%", maxWidth: "100%", transition: "padding-right .3s", boxSizing: "border-box" },
     hdr: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "1.8rem 0 1.4rem", borderBottom: `1px solid ${themePalette.border}`, marginBottom: "2.5rem" },
     label: { color: themePalette.textDim, fontSize: "0.6rem", textTransform: "uppercase", letterSpacing: "3.5px", marginBottom: "0.65rem" },
@@ -2141,7 +2166,8 @@ export default function Forge() {
   };
 
   return (
-    <div style={G.app}>
+    <div className="forge-app" style={G.app}>
+      <div className="forge-backdrop" />
       <style>{`
         @keyframes pulse{0%,100%{opacity:.1}50%{opacity:1}}
         @keyframes spin{to{transform:rotate(360deg)}}
@@ -2220,7 +2246,7 @@ export default function Forge() {
       {intel && <IntelPanel idea={idea} onClose={() => setIntel(false)} apiKey={apiKey} provider={provider} model={model} founderContext={founderContext} />}
       {company && <CompanyBuilder idea={idea} qaCtx={ctxStr(qa)} onClose={() => setCompany(false)} apiKey={apiKey} provider={provider} model={model} founderContext={founderContext} />}
 
-      <div
+      <div className="glass-shell"
         style={{
           width: "100%",
           maxWidth: "1560px",
@@ -2264,6 +2290,7 @@ export default function Forge() {
               </div>
             </div>
             <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", flexWrap: "wrap" }}>
+              <div className="forge-status">{serverStatus}</div>
               {wizardStep === "forge" && (
                 <>
                   <button className="gh" onClick={() => { setIntel(!intel); setCompany(false); }} style={{ ...G.ghost, color: intel ? LIME : TEXT_MUTED, borderColor: intel ? `${LIME}35` : "#181818" }}>⚡ Intel</button>
