@@ -7,15 +7,14 @@ const PURPLE = "#B87FFF";
 const ORANGE = "#FF6B00";
 const PINK = "#FF3C78";
 const CYAN = "#00D4FF";
-const TEXT_LIGHT = "#f4f4f4";
 const TEXT_MUTED = "#d7d7d7";
 const TEXT_DIM = "#b8b8b8";
 const TEXT_SOFT = "#8f8f8f";
 const BRANCH_COLORS = [LIME, ORANGE, CYAN, PINK, PURPLE, "#00FFB2"];
-const DEFAULT_PROVIDER = "openrouter";
-const OPENROUTER_DEFAULT_MODEL = "z-ai/glm-4.5-air:free";
+const DEFAULT_PROVIDER = "mock";
+const OPENROUTER_DEFAULT_MODEL = "deepseek/deepseek-v4-flash:free";
 const OPENROUTER_MODELS = [
-  { label: "Z-AI GLM 4.5 Air (free)", value: "z-ai/glm-4.5-air:free" },
+  { label: "DeepSeek v4 Flash (free)", value: "deepseek/deepseek-v4-flash:free" },
   { label: "GPT-4.1 mini", value: "openai/gpt-4.1-mini" },
   { label: "GPT-4o mini", value: "openai/gpt-4o-mini" },
   { label: "Llama 3.3 70B", value: "meta-llama/llama-3.3-70b-instruct" },
@@ -37,12 +36,62 @@ const PROVIDERS = {
     model: "claude-sonnet-4-20250514",
     path: "/api/anthropic/v1/messages",
   },
+  mock: {
+    label: "Local Demo AI (free)",
+    keyLabel: "No key required",
+    keyExample: "Leave blank",
+    model: "demo",
+    path: "/api/mock/v1",
+  },
+  huggingface: {
+    label: "Hugging Face",
+    keyLabel: "Hugging Face API key",
+    keyExample: "hf_...",
+    model: "google/flan-t5-large",
+    path: "/api/huggingface/v1",
+  },
   openrouter: {
     label: "OpenRouter",
     keyLabel: "OpenRouter API key",
     keyExample: "sk-or-v1-...",
     model: OPENROUTER_DEFAULT_MODEL,
     path: "/api/openrouter/v1",
+  },
+};
+
+const PRODUCT_PATHS = {
+  b2b_saas: {
+    label: 'B2B SaaS',
+    description: 'Target business buyers with a subscription product, pricing tiers, and a revenue operations strategy.',
+    focus: 'Ask for customer willingness to pay, enterprise buyer decision criteria, and channel-led adoption.',
+    guidance: ['Clarify the exact buyer role and the workflow you are replacing.', 'Frame pricing with contract value and payback time.', 'Surface how you will convert a trial lead into a paid account.'],
+  },
+  fintech: {
+    label: 'Fintech',
+    description: 'Build in a regulated payment or embedded finance motion with trust, compliance, and liquidity built-in.',
+    focus: 'Probe banks, compliance, partner integrations, and regulatory risk alongside customer payment clarity.',
+    guidance: ['Name the financial flow and the party who pays for trust.', 'Detail the compliance or risk check that earns you credibility.', 'Show how the revenue model is tied to transaction volume or take rate.'],
+  },
+  consumer_app: {
+    label: 'Consumer App',
+    description: 'Launch a consumer-facing experience that captures retention, daily use, and viral growth.',
+    focus: 'Focus on onboarding, retention hooks, acquisition cost, and pricing/monetization fit.',
+    guidance: ['Be explicit about the customer segment and their emotional job to be done.', 'Capture the exact product habit or network effect you want to create.', 'Define how you will measure early traction and retention.'],
+  },
+};
+
+const WORKFLOW_MODES = {
+  explorer: {
+    label: 'Explorer',
+    details: 'Your idea is still fuzzy. The engine will help you turn raw intuition into a testable thesis and a validated problem statement.',
+  },
+  validator: {
+    label: 'Validator',
+    details: 'Your concept exists. The engine will stress-test assumptions, willingness to pay, and product-market fit before you scale.',
+  },
+  operator: {
+    label: 'Operator',
+    details: 'You have a product or pilot. The engine will build the execution plan, rollout sequence, and operational checklist.',
   },
 };
 
@@ -56,10 +105,6 @@ function providerConfig(provider, modelOverride) {
 
 function providerKeyLabel(provider) {
   return providerConfig(provider).keyLabel;
-}
-
-function providerMissingKeyMessage(provider) {
-  return `Add a ${providerKeyLabel(provider)} to continue.`;
 }
 
 const STORAGE_KEYS = {
@@ -94,51 +139,8 @@ function safeParse(value, fallback) {
   }
 }
 
-function bytesToHex(bytes) {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-function hexToBytes(hex) {
-  return Uint8Array.from(hex.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
-}
-
 function uid() {
   return `${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
-}
-
-async function derivePasswordHash(password, saltBytes) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(password),
-    { name: "PBKDF2" },
-    false,
-    ["deriveBits"]
-  );
-  const bits = await crypto.subtle.deriveBits(
-    {
-      name: "PBKDF2",
-      salt: saltBytes,
-      iterations: 120000,
-      hash: "SHA-256",
-    },
-    key,
-    256
-  );
-  return bytesToHex(new Uint8Array(bits));
-}
-
-async function createPasswordRecord(password) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const hash = await derivePasswordHash(password, salt);
-  return { salt: bytesToHex(salt), hash };
-}
-
-async function verifyPasswordRecord(password, record) {
-  const salt = hexToBytes(record.salt);
-  const hash = await derivePasswordHash(password, salt);
-  return hash === record.hash;
 }
 
 function defaultFounderProfile() {
@@ -203,11 +205,15 @@ function getRealityCheck(profile) {
   return { missing, readiness };
 }
 
-function buildFounderContext(profile, currentUser, memory, idea) {
+function buildFounderContext(profile, currentUser, memory, idea, productTrack, workflowMode) {
+  const track = PRODUCT_PATHS[productTrack] || PRODUCT_PATHS.b2b_saas;
+  const mode = WORKFLOW_MODES[workflowMode] || WORKFLOW_MODES.explorer;
   const snapshot = [
     `Founder: ${currentUser?.name || currentUser?.email || "Unknown founder"}`,
     `Stage: ${(profile?.stage || "pre-revenue").trim() || "pre-revenue"}`,
     `Geo: ${(profile?.geo || "Not set").trim() || "Not set"}`,
+    `Track: ${track.label}`,
+    `Workflow: ${mode.label}`,
     `Customer: ${(profile?.customer || "Not set").trim() || "Not set"}`,
     `Problem: ${(profile?.problem || "Not set").trim() || "Not set"}`,
     `Solution: ${(profile?.solution || "Not set").trim() || "Not set"}`,
@@ -232,6 +238,38 @@ function buildFounderContext(profile, currentUser, memory, idea) {
   return snapshot.join("\n");
 }
 
+function buildQuestionSystem(productTrack, workflowMode) {
+  const track = PRODUCT_PATHS[productTrack] || PRODUCT_PATHS.b2b_saas;
+  const mode = WORKFLOW_MODES[workflowMode] || WORKFLOW_MODES.explorer;
+  return `You are FORGE — the ruthless founder decision engine.
+Track: ${track.label}. Focus: ${track.focus}.
+Workflow mode: ${mode.label}. ${mode.details}
+Ask one direct, decision-driving question at a time. Prioritize paying customers, testable assumptions, execution risks, and go-to-market clarity. Keep the question tightly tied to the current idea and the founder's company context. Return ONLY the question.`;
+}
+
+function buildScoreSystem(productTrack, workflowMode) {
+  const track = PRODUCT_PATHS[productTrack] || PRODUCT_PATHS.b2b_saas;
+  const mode = WORKFLOW_MODES[workflowMode] || WORKFLOW_MODES.explorer;
+  return `You are FORGE — score this idea for the ${track.label} path and the ${mode.label} founder workflow.
+Return JSON only with these fields:
+{
+  "score": 0,
+  "label": "",
+  "verdict": "",
+  "strengths": [""],
+  "gaps": [""],
+  "metrics": {
+    "problem_severity": 0,
+    "willingness_to_pay": 0,
+    "differentiation": 0,
+    "execution_risk": 0
+  },
+  "evidence_links": [""],
+  "user_input_summary": "",
+  "forge_inference_summary": ""
+}`;
+}
+
 function normalizeIdeaScore(score) {
   const rawScore = typeof score?.score === "number" ? score.score : Number(score?.score ?? 0);
   const numeric = Number.isFinite(rawScore) ? Math.max(0, Math.min(100, Math.round(rawScore))) : 0;
@@ -239,8 +277,15 @@ function normalizeIdeaScore(score) {
   const verdict = score?.verdict || (numeric >= 80 ? "This is a founder-grade shot. Tighten execution and test market motion." : numeric >= 60 ? "A solid thesis with a few decisive gaps to close." : numeric >= 40 ? "Promising, but the proof stack is still underbuilt." : "The core claim is not strong enough yet; attack the biggest assumption first.");
   const strengths = Array.isArray(score?.strengths) ? score.strengths : [];
   const gaps = Array.isArray(score?.gaps) ? score.gaps : [];
+  const metrics = typeof score?.metrics === "object" && score?.metrics !== null ? score.metrics : {
+    problem_severity: 0,
+    willingness_to_pay: 0,
+    differentiation: 0,
+    execution_risk: 0,
+  };
+  const evidence_links = Array.isArray(score?.evidence_links) ? score.evidence_links.filter(Boolean) : [];
 
-  return { ...score, score: numeric, label, verdict, strengths, gaps };
+  return { ...score, score: numeric, label, verdict, strengths, gaps, metrics, evidence_links };
 }
 
 function formatExportContent(type, data, idea) {
@@ -519,7 +564,7 @@ function extractJSON(raw) {
   s = s.replace(/,\s*([}\]])/g, "$1");
   
   // Remove control characters
-  s = s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  s = s.replace(/\p{Cc}/gu, "");
   
   try {
     return JSON.parse(s);
@@ -1107,7 +1152,7 @@ ${founderContext}`;
       setBusy(false);
       setTimeout(() => taRef.current?.focus(), 80);
     },
-    [apiKey, busy, idea, inp, provider, model]
+    [apiKey, busy, idea, inp, provider, model, founderContext]
   );
 
   return (
@@ -1396,17 +1441,78 @@ const OUTPUTS = [
   { key: "swot", icon: "🎯", label: "SWOT", desc: "Ruthless strategic breakdown" },
 ];
 
-const Q_SYS = `You are FORGE — ruthless operations chief for serious founders.
-No fluff. No motivation porn. No preamble.
-Return only one question per round. Every question must force a concrete answer and expose a risk, assumption, or next action.
-Rotate: Creative→Critical→Strategic→Logical→repeat.
-Creative: reframes, analogies, what-if, first principles.
-Critical: challenge assumptions, expose weaknesses, stress-test the story.
-Strategic: market, positioning, moat, timing, competition.
-Logical: unit economics, feasibility, sequencing, causality.
-Return ONLY the question. Nothing else.`;
+const Q_SYS = `You are FORGE — the ruthless founder decision engine.
+No fluff. No hype. No framing.
+Ask one question per round that forces the founder to name a paying customer, a real test, an assumption, or a next experiment.
+Rotate through Creative, Critical, Strategic, and Logical styles.
+Tie every question to the idea and the founder's current story.
+Return only the question. Nothing else.`;
 
-const ctxStr = (pairs) => pairs.map((x, i) => `Q${i + 1}: ${x.question}\nA${i + 1}: ${x.answer}`).join("\n\n");
+const QUESTION_STEP_METADATA = [
+  {
+    title: 'Problem',
+    why: 'This reveals the exact pain your customer is paying to escape.',
+    example: 'Example: "Mid-market accounts teams waste 10+ hours monthly reconciling failed transfers."',
+  },
+  {
+    title: 'Customer',
+    why: 'This tells us who will actually open their wallet for your solution.',
+    example: 'Example: "Finance managers at fintech scale-ups handling >500 transactions/day."',
+  },
+  {
+    title: 'Revenue',
+    why: 'This forces a real payment trigger instead of vague hope.',
+    example: 'Example: "They pay once each failed payout costs $2,500 in support time."',
+  },
+  {
+    title: 'Channels',
+    why: 'This exposes the fastest path to real buyer conversations.',
+    example: 'Example: "Cold outreach to 20 VP finance leaders in logistics and marketplaces."',
+  },
+  {
+    title: 'Risk',
+    why: 'This surfaces the biggest assumption that would kill the plan if wrong.',
+    example: 'Example: "The idea depends on customers trusting a third party with payout data."',
+  },
+  {
+    title: 'Moat',
+    why: 'This forces you to prove why the idea won’t be copied in 30 days.',
+    example: 'Example: "We win because we own a proprietary ruleset built from 1,000 rejected cases."',
+  },
+];
+
+const GUEST_FREE_QUESTIONS = 3;
+
+function getQuestionStepMetadata(index) {
+  return QUESTION_STEP_METADATA[index] || {
+    title: `Step ${index + 1}`,
+    why: 'This question sharpens your founder judgement and forces a specific answer.',
+    example: 'Answer with a concrete customer, a number, or a test you can run this week.',
+  };
+}
+
+function normalizeTag(value) {
+  return value.trim().toLowerCase().replace(/[^a-z0-9- ]+/g, '').slice(0, 32);
+}
+
+function evaluateAnswerQuality(answer) {
+  const text = (answer || '').trim();
+  if (!text) {
+    return { difficulty: 'Missing', critique: 'No answer yet. Name one clear fact about the customer or problem.' };
+  }
+  if (text.length < 75) {
+    return { difficulty: 'Too vague', critique: 'This is still too short. Add a concrete customer, metric, or example.' };
+  }
+  if (/\b(any|everyone|someone|people|just|whatever)\b/i.test(text)) {
+    return { difficulty: 'Too broad', critique: 'This is too broad. Name a specific buyer group or situation.' };
+  }
+  if (/\b(probably|maybe|could|might|think)\b/i.test(text)) {
+    return { difficulty: 'Hedged', critique: 'This sounds hedged. Replace wishful terms with a stronger claim or evidence.' };
+  }
+  return { difficulty: 'Founder-ready', critique: 'Good. This answer is specific enough to build the next plan step from.' };
+}
+
+const ctxStr = (pairs) => pairs.map((x, i) => `Q${i + 1}: ${x.question}\nA${i + 1}: ${x.answer}`).join('\n\n');
 
 export default function Forge() {
   const [phase, setPhase] = useState("ignition");
@@ -1423,6 +1529,10 @@ export default function Forge() {
   const [qa, setQa] = useState([]);
   const [curQ, setCurQ] = useState("");
   const [curA, setCurA] = useState("");
+  const [currentTags, setCurrentTags] = useState([]);
+  const [tagValue, setTagValue] = useState("");
+  const [answerCritique, setAnswerCritique] = useState("");
+  const [answerDifficulty, setAnswerDifficulty] = useState("");
   const [loading, setLoading] = useState(false);
   const [loadMsg, setLoadMsg] = useState("");
   const [outType, setOutType] = useState(null);
@@ -1431,9 +1541,13 @@ export default function Forge() {
   const [intel, setIntel] = useState(false);
   const [company, setCompany] = useState(false);
   const [ideaScore, setIdeaScore] = useState(null);
+  const [productTrack, setProductTrack] = useState("b2b_saas");
+  const [workflowMode, setWorkflowMode] = useState("explorer");
+  const [variants, setVariants] = useState([]);
+  const [reflection, setReflection] = useState("");
+  const [savedReflection, setSavedReflection] = useState("");
   const [currentUser, setCurrentUser] = useState(null);
   const [wizardStep, setWizardStep] = useState("forge");
-  const [sideView, setSideView] = useState("forge");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [themeMode, setThemeMode] = useState(() => {
     if (typeof window === "undefined") return "dark";
@@ -1457,12 +1571,57 @@ export default function Forge() {
   });
   const [waitlistStatus, setWaitlistStatus] = useState("");
   const [waitlistBusy, setWaitlistBusy] = useState(false);
-  const [founderProfile, setFounderProfile] = useState(defaultFounderProfile);
-  const [memoryLog, setMemoryLog] = useState([]);
-  const [ideaHistory, setIdeaHistory] = useState([]);
+  const [founderProfile, setFounderProfile] = useState(() => {
+    if (typeof window === "undefined") return defaultFounderProfile();
+    return safeParse(localStorage.getItem(STORAGE_KEYS.profile), defaultFounderProfile());
+  });
+  const [memoryLog, setMemoryLog] = useState(() => {
+    if (typeof window === "undefined") return [];
+    const saved = safeParse(localStorage.getItem(STORAGE_KEYS.memory), []);
+    return Array.isArray(saved) ? saved : [];
+  });
+  const [ideaHistory, setIdeaHistory] = useState(() => {
+    if (typeof window === "undefined") return [];
+    const saved = safeParse(localStorage.getItem(STORAGE_KEYS.history), []);
+    return Array.isArray(saved) ? saved : [];
+  });
   const [memoryNote, setMemoryNote] = useState("");
   const taRef = useRef(null);
   const { prefetch, consume } = usePrefetch(apiKey, provider, model);
+
+  const addVariant = () => {
+    const trimmed = idea.trim();
+    if (!trimmed) return;
+    setVariants((prev) => [
+      ...prev,
+      {
+        id: `${Date.now()}-${prev.length + 1}`,
+        label: `Variant ${prev.length + 1}`,
+        idea: trimmed,
+        score: ideaScore?.score ?? 0,
+        createdAt: new Date().toLocaleTimeString(),
+      },
+    ]);
+  };
+
+  const saveReflection = () => {
+    const note = reflection.trim();
+    if (!note) return;
+    setSavedReflection(note);
+    setReflection("");
+  };
+
+  const renderMetricBar = (label, value) => {
+    const normalized = Math.max(0, Math.min(100, Math.round(value)));
+    return (
+      <div style={{ marginBottom: 4 }}>
+        <div style={{ fontSize: 12, color: "var(--editorForeground)" }}>{label}: {normalized}</div>
+        <div style={{ width: "100%", height: 8, background: "rgba(255,255,255,0.08)", borderRadius: 999 }}>
+          <div style={{ width: `${normalized}%`, height: "100%", background: "#60a5fa", borderRadius: 999 }} />
+        </div>
+      </div>
+    );
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -1488,18 +1647,8 @@ export default function Forge() {
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    const savedProfile = safeParse(localStorage.getItem(STORAGE_KEYS.profile), defaultFounderProfile());
-    const savedMemory = safeParse(localStorage.getItem(STORAGE_KEYS.memory), []);
-    const savedHistory = safeParse(localStorage.getItem(STORAGE_KEYS.history), []);
-
-    setFounderProfile(savedProfile);
-    setMemoryLog(Array.isArray(savedMemory) ? savedMemory : []);
-    setIdeaHistory(Array.isArray(savedHistory) ? savedHistory : []);
-  }, []);
-
-  useEffect(() => {
     if (currentUser && wizardStep === "auth") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setWizardStep("forge");
     }
   }, [currentUser, wizardStep]);
@@ -1553,7 +1702,7 @@ export default function Forge() {
     }
   }, [waitlistEmail, waitlistStage]);
 
-  const founderContext = useMemo(() => buildFounderContext(founderProfile, currentUser, memoryLog, idea), [founderProfile, currentUser, memoryLog, idea]);
+  const founderContext = useMemo(() => buildFounderContext(founderProfile, currentUser, memoryLog, idea, productTrack, workflowMode), [founderProfile, currentUser, memoryLog, idea, productTrack, workflowMode]);
   const realityGate = useMemo(() => getRealityCheck(founderProfile), [founderProfile]);
   const isAuthenticated = Boolean(currentUser);
 
@@ -1607,7 +1756,6 @@ export default function Forge() {
       setErr("");
       setAuthPassword("");
       setWizardStep("forge");
-      setSideView("forge");
     } catch (error) {
       setAuthError(error.message || "Sign in failed.");
     }
@@ -1650,7 +1798,6 @@ export default function Forge() {
       setAuthPassword("");
       setAuthName("");
       setWizardStep("forge");
-      setSideView("forge");
     } catch (error) {
       setAuthError(error.message || "Sign up failed.");
     }
@@ -1668,7 +1815,6 @@ export default function Forge() {
 
     setCurrentUser(null);
     setWizardStep("forge");
-    setSideView("forge");
     setAuthError("");
     setErr("");
   }, []);
@@ -1711,8 +1857,7 @@ export default function Forge() {
 
       try {
         const s = await ai(
-          `Score this startup idea. JSON only, use percentages 0-100. Be brutal and founder-real.
-Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":["s1","s2"],"gaps":["g1","g2"]}`,
+          buildScoreSystem(productTrack, workflowMode),
           `Founder context:\n${founderContext}\n\nIdea:"${idea}"\n${ctxStr(pairs)}`,
           true,
           800,
@@ -1722,9 +1867,11 @@ Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":
           model
         );
         setIdeaScore(normalizeIdeaScore(s));
-      } catch {}
+      } catch (error) {
+        console.error(error);
+      }
     },
-    [apiKey, idea, provider, model, founderContext, isAuthenticated]
+    [apiKey, idea, provider, model, founderContext, isAuthenticated, productTrack, workflowMode]
   );
 
   const triggerPrefetch = useCallback(
@@ -1733,9 +1880,9 @@ Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":
       const styles = ["Creative", "Critical", "Strategic", "Logical"];
       const nextStyle = styles[updated.length % styles.length];
       const key = `q${updated.length + 1}`;
-      prefetch(Q_SYS, `Founder context:\n${founderContext}\n\nIdea:"${idea}"\n\nSo far:\n${ctxStr(updated)}\n\nQ${updated.length + 1} of ${Q_TARGET}: Use ${nextStyle} style. Biggest unexplored gap. Push hard.`, key);
+      prefetch(buildQuestionSystem(productTrack, workflowMode), `Founder context:\n${founderContext}\n\nIdea:"${idea}"\n\nSo far:\n${ctxStr(updated)}\n\nQ${updated.length + 1} of ${Q_TARGET}: Use ${nextStyle} style. Biggest unexplored gap. Push hard.`, key);
     },
-    [idea, founderContext, prefetch]
+    [idea, founderContext, prefetch, productTrack, workflowMode]
   );
 
   const ignite = async () => {
@@ -1745,11 +1892,28 @@ Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":
     }
     setLoading(true);
     setErr("");
+    setCurrentTags([]);
+    setTagValue("");
+    setAnswerCritique("");
+    setAnswerDifficulty("");
     try {
-      const q = await ai(Q_SYS, `Founder context:\n${founderContext}\n\nIdea:"${idea}"\nQ1 of ${Q_TARGET}. Creative style. Most foundational: what they're ACTUALLY building, for WHOM, the single reason it must exist NOW.`, false, 1000, 2, apiKey, provider, model);
+      const q = await ai(
+        buildQuestionSystem(productTrack, workflowMode),
+        `Founder context:\n${founderContext}\n\nIdea:"${idea}"\nQ1 of ${Q_TARGET}. Creative style. Most foundational: what they're ACTUALLY building, for WHOM, the single reason it must exist NOW.`,
+        false,
+        1000,
+        2,
+        apiKey,
+        provider,
+        model
+      );
       setCurQ(q);
       setPhase("questioning");
-      prefetch(Q_SYS, `Founder context:\n${founderContext}\n\nIdea:"${idea}"\n\nQ2 of ${Q_TARGET}: Critical style. After they answer Q1 about what/who/why, push on the biggest assumption baked into their idea.`, "q2_pre");
+      prefetch(
+        buildQuestionSystem(productTrack, workflowMode),
+        `Founder context:\n${founderContext}\n\nIdea:"${idea}"\n\nQ2 of ${Q_TARGET}: Critical style. After they answer Q1 about what/who/why, push on the biggest assumption baked into their idea.`,
+        "q2_pre"
+      );
     } catch (e) {
       setErr(e.message);
     }
@@ -1759,9 +1923,16 @@ Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":
   const next = async () => {
     if (!curA.trim() || loading) return;
     setErr("");
-    const updated = [...qa, { question: curQ, answer: curA }];
+    const normalizedTags = currentTags.map(normalizeTag).filter(Boolean);
+    const feedback = evaluateAnswerQuality(curA);
+    setAnswerCritique(feedback.critique);
+    setAnswerDifficulty(feedback.difficulty);
+    const updated = [...qa, { question: curQ, answer: curA.trim(), tags: normalizedTags }];
     setQa(updated);
     setCurA("");
+    setCurrentTags([]);
+    setTagValue("");
+
     if (updated.length >= Q_TARGET) {
       if (!isAuthenticated) {
         setErr("Create a free account to unlock your Idea Score and roadmap.");
@@ -1779,7 +1950,16 @@ Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":
       const nextStyle = styles[updated.length % styles.length];
       const key = `q${updated.length + 1}`;
       const cached = await Promise.race([consume(key), new Promise((r) => setTimeout(() => r(null), 200))]);
-      const q = cached || (await ai(Q_SYS, `Founder context:\n${founderContext}\n\nIdea:"${idea}"\n\nSo far:\n${ctxStr(updated)}\n\nQ${updated.length + 1} of ${Q_TARGET}: ${nextStyle} style. Biggest unexplored gap. Go hard.`, false, 1000, 2, apiKey, provider, model));
+      const q = cached || (await ai(
+        buildQuestionSystem(productTrack, workflowMode),
+        `Founder context:\n${founderContext}\n\nIdea:"${idea}"\n\nSo far:\n${ctxStr(updated)}\n\nQ${updated.length + 1} of ${Q_TARGET}: ${nextStyle} style. Biggest unexplored gap. Go hard.`,
+        false,
+        1000,
+        2,
+        apiKey,
+        provider,
+        model
+      ));
       setCurQ(q);
     } catch (e) {
       setErr(e.message);
@@ -1916,7 +2096,6 @@ Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":
   };
 
   const openSideView = useCallback((target) => {
-    setSideView(target);
     if (target === "forge") {
       setWizardStep("forge");
       return;
@@ -1945,8 +2124,6 @@ Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":
       setWizardStep("auth");
     }
   }, []);
-
-  const showTools = phase !== "ignition";
   const scoreColor = (s) => (s >= 80 ? LIME : s >= 60 ? ORANGE : s >= 40 ? "#FFD700" : PINK);
   const effectiveTheme = themeMode === "system" && typeof window !== "undefined" && window.matchMedia ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light") : themeMode;
   const themePalette = resolveTheme(effectiveTheme);
@@ -2376,18 +2553,78 @@ Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":
             <div style={{ display: "grid", gap: "1rem" }}>
               {phase === "ignition" && (
                 <div style={{ animation: "fadeIn .4s ease" }}>
-                  <p style={G.label}>Drop your raw idea</p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "0.8rem" }}>
+                    <div>
+                      <p style={{ ...G.label, marginBottom: "0.45rem" }}>FORGE PROMISE</p>
+                      <h2 style={{ margin: 0, fontSize: "1.25rem", lineHeight: "1.5", fontWeight: 800 }}>Investor-grade validation in 30 minutes from a single founder hypothesis.</h2>
+                    </div>
+                    <div style={{ display: "grid", gap: "0.85rem", padding: "1rem", borderRadius: "14px", border: `1px solid ${LIME}20`, background: `${themePalette.panelAlt}` }}>
+                      <div style={{ color: TEXT_DIM, fontSize: "0.78rem" }}>What you will build:</div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.9rem" }}>
+                        <div style={{ padding: "0.95rem", borderRadius: "12px", background: themePalette.pageBg, border: `1px solid ${themePalette.border}` }}>
+                          <div style={{ fontSize: "0.85rem", fontWeight: 700, marginBottom: "0.5rem" }}>Result stack snapshot</div>
+                          <div style={{ color: TEXT_MUTED, fontSize: "0.8rem", lineHeight: "1.65" }}>
+                            • Problem: painful manual workflow costing 10+ hours per week.<br />
+                            • Customer: revenue operations leaders at fintechs with 500+ monthly payouts.<br />
+                            • Moat: proprietary rules built from real declined payment cases.<br />
+                            • Plan: validate 5 buyers, launch a paid pilot, lock first revenue in 30 days.
+                          </div>
+                        </div>
+                        <div style={{ padding: "0.95rem", borderRadius: "12px", background: themePalette.pageBg, border: `1px solid ${themePalette.border}` }}>
+                          <div style={{ fontSize: "0.85rem", fontWeight: 700, marginBottom: "0.5rem" }}>Why FORGE works</div>
+                          <div style={{ color: TEXT_MUTED, fontSize: "0.8rem", lineHeight: "1.65" }}>
+                            It converts raw founder intuition into a focused question sequence, then turns the answers into a decision-grade plan and score.
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display: "grid", gap: "0.9rem", marginTop: "1.4rem" }}>
+                    <div>
+                      <div style={{ ...G.label }}>Choose your product track</div>
+                      <div style={{ display: "flex", gap: "0.65rem", flexWrap: "wrap" }}>
+                        {Object.entries(PRODUCT_PATHS).map(([key, path]) => (
+                          <button key={key} type="button" style={{
+                            ...G.ghost,
+                            borderColor: productTrack === key ? LIME : themePalette.border,
+                            color: productTrack === key ? LIME : themePalette.textPrimary,
+                            background: productTrack === key ? "rgba(200,255,0,0.1)" : themePalette.panelAlt,
+                          }} onClick={() => setProductTrack(key)}>{path.label}</button>
+                        ))}
+                      </div>
+                      <div style={{ color: TEXT_DIM, fontSize: "0.78rem", marginTop: "0.55rem" }}>{PRODUCT_PATHS[productTrack].description}</div>
+                    </div>
+                    <div>
+                      <div style={{ ...G.label }}>Choose your workflow mode</div>
+                      <div style={{ display: "flex", gap: "0.65rem", flexWrap: "wrap" }}>
+                        {Object.entries(WORKFLOW_MODES).map(([key, mode]) => (
+                          <button key={key} type="button" style={{
+                            ...G.ghost,
+                            borderColor: workflowMode === key ? LIME : themePalette.border,
+                            color: workflowMode === key ? LIME : themePalette.textPrimary,
+                            background: workflowMode === key ? "rgba(200,255,0,0.1)" : themePalette.panelAlt,
+                          }} onClick={() => setWorkflowMode(key)}>{mode.label}</button>
+                        ))}
+                      </div>
+                      <div style={{ color: TEXT_DIM, fontSize: "0.78rem", marginTop: "0.55rem" }}>{WORKFLOW_MODES[workflowMode].details}</div>
+                    </div>
+                  </div>
+                  <p style={{ ...G.label, marginTop: "1.5rem" }}>Drop your raw idea</p>
                   <textarea style={{ ...G.ta, height: "155px" }} placeholder={"No polish needed. Half-baked is fine.\nRaw and messy is where the best ideas live."} value={idea} onChange={(e) => setIdea(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !loading) ignite(); }} />
                   <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginTop: "0.9rem", flexWrap: "wrap" }}>
                     <button style={{ ...G.btn, opacity: !idea.trim() || loading ? 0.28 : 1 }} onClick={ignite} disabled={!idea.trim() || loading}>{loading ? "LOADING…" : "IGNITE →"}</button>
                     <span style={{ color: TEXT_DIM, fontSize: "0.6rem" }}>⌘ + Enter</span>
                   </div>
                   {!isAuthenticated && (
-                    <div style={{ marginTop: "0.9rem", padding: "0.8rem 0.9rem", borderRadius: "9px", border: `1px solid ${LIME}18`, background: `${LIME}05`, color: TEXT_MUTED, fontSize: "0.74rem", lineHeight: 1.6 }}>
-                      Guest mode is live. Your first 3 questions are free, and you can create an account later to save your work and unlock the full score + roadmap experience.
+                    <div style={{ marginTop: "0.9rem", padding: "0.9rem 1rem", borderRadius: "10px", border: `1px solid ${LIME}18`, background: `${LIME}05`, color: TEXT_MUTED, fontSize: "0.74rem", lineHeight: 1.6 }}>
+                      Guest mode is live. You have {Math.max(0, GUEST_FREE_QUESTIONS - qa.length)} free questions before sign-up is suggested.
                       <button className="gh" style={{ ...G.ghost, marginLeft: "0.6rem", display: "inline-flex" }} onClick={() => openSideView("auth")}>Create account</button>
                     </div>
                   )}
+                  <div style={{ marginTop: "0.9rem", display: "grid", gap: "0.7rem" }}>
+                    <div style={{ color: TEXT_DIM, fontSize: "0.76rem" }}>Used by pre-seed and seed founders who need a sharper plan, not another vague idea generator.</div>
+                    <div style={{ color: TEXT_DIM, fontSize: "0.76rem" }}>This is not a landing page builder. It is a founder decision engine that forces your most important assumptions on the table.</div>
+                  </div>
                   {err && <div style={{ ...G.err, marginTop: "0.9rem" }}>{err}</div>}
                 </div>
               )}
@@ -2399,7 +2636,17 @@ Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":
                       <div key={i} style={{ height: "2px", flex: 1, borderRadius: "2px", background: i < qa.length ? LIME : i === qa.length ? `${LIME}32` : "#111", transition: "background .4s" }} />
                     ))}
                   </div>
-                  <div style={{ color: TEXT_DIM, fontSize: "0.57rem", letterSpacing: "2px", marginBottom: "2.2rem" }}>{qa.length}/{Q_TARGET} complete</div>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: "1rem", marginBottom: "1rem", flexWrap: "wrap" }}>
+                    <div>
+                      <div style={{ fontSize: "0.65rem", letterSpacing: "2px", color: TEXT_DIM, textTransform: "uppercase" }}>Step {qa.length + 1} of {Q_TARGET}</div>
+                      <div style={{ fontSize: "1rem", fontWeight: 700, color: "#f4f4f4", marginTop: "0.25rem" }}>{getQuestionStepMetadata(qa.length).title}</div>
+                    </div>
+                    <div style={{ color: TEXT_DIM, fontSize: "0.75rem", maxWidth: "480px" }}>{getQuestionStepMetadata(qa.length).why}</div>
+                  </div>
+                  <div style={{ marginBottom: "1.4rem", padding: "0.95rem 1rem", borderRadius: "12px", background: themePalette.panelAlt, border: `1px solid ${themePalette.border}` }}>
+                    <div style={{ fontSize: "0.72rem", color: TEXT_DIM, marginBottom: "0.45rem", letterSpacing: "1.5px", textTransform: "uppercase" }}>Example answer</div>
+                    <div style={{ color: "#e5e5e5", fontSize: "0.87rem", lineHeight: "1.6" }}>{getQuestionStepMetadata(qa.length).example}</div>
+                  </div>
                   {loading ? (
                     <div style={{ padding: "2.5rem 0" }}>
                       <span style={{ color: LIME, fontSize: "0.68rem", letterSpacing: "2.5px" }}>FORGE</span>
@@ -2410,19 +2657,39 @@ Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":
                     </div>
                   ) : (
                     <div>
-                      <p style={{ color: "#e5e5e5", fontSize: "1.1rem", lineHeight: "1.78", margin: "0 0 2rem", fontWeight: "300" }}>{curQ}</p>
+                      <p style={{ color: "#e5e5e5", fontSize: "1.1rem", lineHeight: "1.78", margin: "0 0 1.2rem", fontWeight: "300" }}>{curQ}</p>
                       <p style={G.label}>Your answer</p>
                       <textarea ref={taRef} style={{ ...G.ta, height: "108px" }} placeholder="Honest. No performance." value={curA} onChange={(e) => { setCurA(e.target.value); if (e.target.value.length === 3) triggerPrefetch([...qa, { question: curQ, answer: e.target.value }]); }} onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && curA.trim() && !loading) next(); }} autoFocus />
-                      <div style={{ display: "flex", gap: "0.7rem", marginTop: "0.9rem", alignItems: "center", flexWrap: "wrap" }}>
-                        <button style={{ ...G.btn, opacity: !curA.trim() ? 0.22 : 1 }} onClick={next} disabled={!curA.trim() || loading}>{qa.length + 1 === Q_TARGET ? "FINISH →" : "NEXT →"}</button>
-                        {qa.length >= 3 && !isAuthenticated && (
-                          <button className="gh" style={G.ghost} onClick={() => { setErr("Create a free account to unlock your Idea Score and roadmap."); setPhase("output-select"); }}>skip to unlock →</button>
-                        )}
-                        {qa.length >= 3 && isAuthenticated && <button className="gh" style={G.ghost} onClick={() => { scoreIdea(qa); setPhase("output-select"); }}>skip →</button>}
+                      <div style={{ display: "grid", gap: "0.75rem", marginTop: "0.85rem" }}>
+                        <div style={{ display: "grid", gap: "0.5rem" }}>
+                          <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center" }}>
+                            {currentTags.map((tag) => (
+                              <button key={tag} style={{ border: `1px solid ${LIME}30`, background: "rgba(200,255,0,0.08)", color: LIME, borderRadius: "999px", padding: "0.45rem 0.7rem", fontSize: "0.72rem", cursor: "pointer" }} onClick={() => setCurrentTags((prev) => prev.filter((t) => t !== tag))}>#{tag} ×</button>
+                            ))}
+                          </div>
+                          <div style={{ display: "flex", gap: "0.7rem", flexWrap: "wrap", alignItems: "center" }}>
+                            <input value={tagValue} onChange={(e) => setTagValue(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); const tag = normalizeTag(tagValue); if (tag && !currentTags.includes(tag) && currentTags.length < 5) { setCurrentTags((prev) => [...prev, tag]); } setTagValue(''); } }} placeholder="Add a tag like segment, region, risk…" style={{ flex: 1, minWidth: "0", background: themePalette.panelAlt, border: `1px solid ${themePalette.border}`, borderRadius: "7px", color: themePalette.textPrimary, padding: "0.85rem 1rem", fontFamily: "monospace", fontSize: "0.87rem", outline: "none" }} />
+                            <button className="gh" style={{ ...G.ghost, fontSize: "0.72rem" }} onClick={() => { const tag = normalizeTag(tagValue); if (tag && !currentTags.includes(tag) && currentTags.length < 5) { setCurrentTags((prev) => [...prev, tag]); } setTagValue(''); }}>Add tag</button>
+                          </div>
+                          <div style={{ color: TEXT_DIM, fontSize: "0.68rem" }}>Tags help FORGE connect your answers to later plan sections.</div>
+                        </div>
+                        <div style={{ display: "flex", gap: "0.6rem", flexWrap: "wrap", alignItems: "center" }}>
+                          <button style={{ ...G.btn, opacity: !curA.trim() ? 0.22 : 1 }} onClick={next} disabled={!curA.trim() || loading}>{qa.length + 1 === Q_TARGET ? "FINISH →" : "NEXT →"}</button>
+                          {qa.length >= 3 && !isAuthenticated && (
+                            <button className="gh" style={G.ghost} onClick={() => { setErr("Create a free account to unlock your Idea Score and roadmap."); setPhase("output-select"); }}>skip to unlock →</button>
+                          )}
+                          {qa.length >= 3 && isAuthenticated && <button className="gh" style={G.ghost} onClick={() => { scoreIdea(qa); setPhase("output-select"); }}>skip →</button>}
+                        </div>
                       </div>
+                      {(answerDifficulty || answerCritique) && (
+                        <div style={{ marginTop: "0.95rem", padding: "0.9rem 1rem", borderRadius: "9px", background: themePalette.panelAlt, border: `1px solid ${themePalette.border}`, color: TEXT_DIM, fontSize: "0.78rem", lineHeight: 1.55 }}>
+                          <div style={{ fontWeight: 700, color: answerDifficulty === 'Founder-ready' ? LIME : PINK, marginBottom: "0.35rem" }}>{answerDifficulty}</div>
+                          <div>{answerCritique}</div>
+                        </div>
+                      )}
                       {!isAuthenticated && qa.length >= 3 && (
                         <div style={{ marginTop: "0.9rem", padding: "0.8rem 0.9rem", borderRadius: "9px", border: `1px solid ${LIME}18`, background: `${LIME}05`, color: TEXT_MUTED, fontSize: "0.74rem", lineHeight: 1.6 }}>
-                          You’ve got the first insight loop. Create a free account to save this work and unlock the score + roadmap.
+                          You’ve unlocked a sharper insight loop. Create a free account to save your work and lock in the full score + roadmap.
                           <button className="gh" style={{ ...G.ghost, marginLeft: "0.6rem", display: "inline-flex" }} onClick={() => openSideView("auth")}>Create account</button>
                         </div>
                       )}
@@ -2457,6 +2724,26 @@ Return {"score":85,"label":"Strong","verdict":"brutal one sentence","strengths":
                             <div key={i} style={{ color: TEXT_MUTED, fontSize: "0.74rem", marginBottom: "0.15rem" }}>→ {g}</div>
                           ))}
                         </div>
+                      </div>
+                      <div style={{ marginTop: "1rem", display: "grid", gap: "0.75rem" }}>
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "0.6rem" }}>
+                          {Object.entries(ideaScore.metrics || {}).map(([metric, value]) => (
+                            <div key={metric} style={{ padding: "0.85rem", borderRadius: "10px", background: "rgba(255,255,255,0.03)", border: `1px solid ${themePalette.border}` }}>
+                              <div style={{ fontSize: "0.65rem", textTransform: "uppercase", letterSpacing: "1.7px", color: TEXT_DIM, marginBottom: "0.35rem" }}>{metric.replace(/_/g, " ")}</div>
+                              <div style={{ fontSize: "1rem", fontWeight: 700, color: "#fff" }}>{Math.round(value)}%</div>
+                            </div>
+                          ))}
+                        </div>
+                        {Array.isArray(ideaScore.evidence_links) && ideaScore.evidence_links.length > 0 && (
+                          <div style={{ color: TEXT_DIM, fontSize: "0.76rem", lineHeight: "1.65" }}>
+                            Evidence:
+                            <ul style={{ margin: "0.5rem 0 0", paddingLeft: "1.2rem" }}>
+                              {ideaScore.evidence_links.map((link, i) => (
+                                <li key={i} style={{ marginBottom: "0.3rem" }}>{link}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}

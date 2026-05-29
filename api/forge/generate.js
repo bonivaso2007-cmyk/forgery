@@ -1,5 +1,5 @@
-const DEFAULT_MODEL = 'google/gemini-2.0-flash-001';
-const DEFAULT_PROVIDER = 'openrouter';
+const DEFAULT_MODEL = 'demo';
+const DEFAULT_PROVIDER = 'mock';
 const DEFAULT_FORGE_SYSTEM_PROMPT = `You are FORGE, a ruthless founder decision engine.
 Return exactly one JSON object and nothing else. Do not use markdown, bullets, code fences, or extra commentary.
 Use this schema:
@@ -260,6 +260,19 @@ function buildOpenRouterPayload({ model, system, user, maxTokens, temperature, t
   };
 }
 
+function isInsufficientCreditsError(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('insufficient credits')
+    || text.includes('never purchased credits')
+    || text.includes('quota')
+    || text.includes('402')
+    || text.includes('payment');
+}
+
+function generateMockResponse(payload = {}) {
+  return buildFallbackResponse(payload, 'Local demo AI is active because a real provider was unavailable.');
+}
+
 async function providerRequest(url, options) {
   const response = await fetch(url, options);
   const rawText = await response.text();
@@ -275,6 +288,10 @@ async function generateFromProvider(payload) {
   const { provider = DEFAULT_PROVIDER, model = DEFAULT_MODEL, apiKey, system = DEFAULT_FORGE_SYSTEM_PROMPT, user, maxTokens = 800, temperature = 0.5, trustedDomains } = payload;
   const resolvedApiKey = (apiKey || '').trim() || process.env.FORGE_AI_API_KEY?.trim();
 
+  if (provider === 'mock') {
+    return generateMockResponse(payload);
+  }
+
   if (!resolvedApiKey) {
     throw new Error('Missing backend API key. Add FORGE_AI_API_KEY to your env vars.');
   }
@@ -283,25 +300,33 @@ async function generateFromProvider(payload) {
     throw new Error('This MVP deployment currently supports OpenRouter only.');
   }
 
-  const data = await providerRequest('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${resolvedApiKey}`,
-      'HTTP-Referer': 'https://forge.local',
-      'X-OpenRouter-Title': 'FORGE MVP',
-    },
-    body: JSON.stringify(buildOpenRouterPayload({
-      model,
-      system,
-      user,
-      maxTokens,
-      temperature,
-      trustedDomains,
-    })),
-  });
+  try {
+    const data = await providerRequest('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${resolvedApiKey}`,
+        'HTTP-Referer': 'https://forge.local',
+        'X-OpenRouter-Title': 'FORGE MVP',
+      },
+      body: JSON.stringify(buildOpenRouterPayload({
+        model,
+        system,
+        user,
+        maxTokens,
+        temperature,
+        trustedDomains,
+      })),
+    });
 
-  return extractText(data);
+    return extractText(data);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || '');
+    if (isInsufficientCreditsError(message)) {
+      return generateMockResponse(payload);
+    }
+    throw error;
+  }
 }
 
 export default async function handler(request, response) {

@@ -5,6 +5,11 @@ import { fileURLToPath } from 'node:url';
 import { createServer as createViteServer } from 'vite';
 import { createClient } from '@supabase/supabase-js';
 import { PostHog } from 'posthog-node';
+import helmet from 'helmet';
+import cors from 'cors';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
+import * as db from './db.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,8 +18,41 @@ const isProd = process.env.NODE_ENV === 'production';
 
 // Per-IP per-minute rate limiter for the generate endpoint
 const generateRateMap = new Map();
+const globalRateMap = new Map();
+const authRateMap = new Map();
+
+function createRateLimitHandler(rateMap, maxRequests, windowMs, message) {
+  return (req, res, next) => {
+    const key = getRequestIp(req) || req.ip || req.headers['x-forwarded-for'] || 'unknown';
+    const now = Date.now();
+    const entry = rateMap.get(key) || { count: 0, resetAt: now + windowMs };
+
+    if (entry.resetAt <= now) {
+      entry.count = 0;
+      entry.resetAt = now + windowMs;
+    }
+
+    entry.count += 1;
+    rateMap.set(key, entry);
+
+    if (entry.count > maxRequests) {
+      res.setHeader('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
+      return res.status(429).json({ error: message });
+    }
+
+    next();
+  };
+}
 
 const PROVIDER_DEFAULTS = {
+  mock: {
+    label: 'Local Demo AI (free)',
+    model: 'demo',
+  },
+  huggingface: {
+    label: 'Hugging Face',
+    model: 'google/flan-t5-large',
+  },
   gemini: {
     label: 'Google Gemini',
     model: 'gemini-2.0-flash',
@@ -25,7 +63,7 @@ const PROVIDER_DEFAULTS = {
   },
   openrouter: {
     label: 'OpenRouter',
-    model: 'z-ai/glm-4.5-air:free',
+    model: 'deepseek/deepseek-v4-flash:free',
   },
 };
 
@@ -60,6 +98,17 @@ function loadLocalEnv() {
 
 loadLocalEnv();
 
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me-before-prod';
+const SESSION_COOKIE = 'forge_session';
+const OAUTH_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/api/auth/google/callback';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '433261777203-2cmdeen156bpoi6se920f96vb3so1e7r.apps.googleusercontent.com';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const GOOGLE_REDIRECT_SUCCESS = process.env.GOOGLE_REDIRECT_SUCCESS || '/';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
+const GLOBAL_RATE_LIMIT = Number(process.env.GLOBAL_RATE_LIMIT || 200);
+const AUTH_RATE_LIMIT = Number(process.env.AUTH_RATE_LIMIT || 10);
+const FORGE_GENERATE_RATE_LIMIT = Number(process.env.FORGE_GENERATE_RATE_LIMIT || 20);
+
 // Supabase server client (service role for admin operations)
 const supabaseUrl = process.env.VITE_SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -76,7 +125,7 @@ const posthog = process.env.POSTHOG_API_KEY
   ? new PostHog(process.env.POSTHOG_API_KEY, { host: process.env.POSTHOG_HOST || 'https://us.i.posthog.com' })
   : null;
 
-const DEFAULT_PROVIDER = process.env.FORGE_AI_PROVIDER || 'openrouter';
+const DEFAULT_PROVIDER = process.env.FORGE_AI_PROVIDER || 'mock';
 const DEFAULT_MODEL = process.env.FORGE_AI_MODEL || PROVIDER_DEFAULTS[DEFAULT_PROVIDER]?.model || PROVIDER_DEFAULTS.openrouter.model;
 const DEFAULT_API_KEY = process.env.FORGE_AI_API_KEY?.trim() || '';
 const DEFAULT_FORGE_SYSTEM_PROMPT = `You are FORGE, a ruthless founder decision engine.
@@ -123,19 +172,132 @@ function parseTrustedDomains(rawValue) {
 
 const TRUSTED_DOMAINS = parseTrustedDomains(process.env.FORGE_TRUSTED_DOMAINS);
 
+function parseCookies(cookieHeader = '') {
+  return cookieHeader.split(';').reduce((cookies, pair) => {
+    const [name, ...rest] = pair.split('=');
+    if (!name) return cookies;
+    cookies[name.trim()] = decodeURIComponent(rest.join('=').trim() || '');
+    return cookies;
+  }, {});
+}
+
+function getTokenFromRequest(req) {
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader) return null;
+  return parseCookies(cookieHeader)[SESSION_COOKIE] || null;
+}
+
+function signJwt(user) {
+  return jwt.sign(
+    {
+      sub: user.id,
+      email: user.email,
+      name: user.name || '',
+      provider: user.provider || 'local',
+    },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
+}
+
+function verifyJwtToken(token) {
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
+
+async function verifyAuthToken(reqOrHeader) {
+  let token = null;
+
+  if (typeof reqOrHeader === 'string') {
+    if (reqOrHeader.startsWith('Bearer ')) {
+      token = reqOrHeader.slice(7).trim();
+    } else {
+      token = reqOrHeader.trim();
+    }
+  } else if (reqOrHeader?.headers) {
+    token = getTokenFromRequest(reqOrHeader);
+  }
+
+  if (token) {
+    const payload = verifyJwtToken(token);
+    if (payload && payload.sub && payload.email) {
+      return {
+        id: payload.sub,
+        email: payload.email,
+        name: payload.name || '',
+        provider: payload.provider || 'local',
+      };
+    }
+  }
+
+  if (!supabase || typeof reqOrHeader !== 'object') {
+    return null;
+  }
+
+  const authHeader = reqOrHeader.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return null;
+  }
+
+  const tokenValue = authHeader.slice(7);
+  const { data: { user }, error } = await supabase.auth.getUser(tokenValue);
+  if (error || !user) {
+    return null;
+  }
+
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.user_metadata?.name || user.email?.split('@')[0] || '',
+  };
+}
+
+function setSessionCookie(res, token) {
+  res.cookie(SESSION_COOKIE, token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isProd,
+    path: '/',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+}
+
+function clearSessionCookie(res) {
+  res.cookie(SESSION_COOKIE, '', {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isProd,
+    path: '/',
+    expires: new Date(0),
+  });
+}
+
 function providerMissingKeyMessage(provider) {
   return `Missing API key for ${PROVIDER_DEFAULTS[provider]?.label || provider}.`;
 }
 
 function getRequestIp(req) {
-  // Only trust X-Forwarded-For when running behind a known reverse proxy (opt-in via env)
-  if (process.env.TRUST_PROXY === 'true') {
-    const xForwardedFor = req.headers['x-forwarded-for'];
-    if (typeof xForwardedFor === 'string') {
-      const first = xForwardedFor.split(',')[0].trim();
-      if (first) return first;
+  const trustedProxyIp = process.env.TRUSTED_PROXY_IP?.trim();
+  const trustProxy = process.env.TRUST_PROXY === 'true' || Boolean(trustedProxyIp);
+
+  if (trustProxy) {
+    const remoteAddr = req.socket?.remoteAddress;
+    if (!trustedProxyIp || remoteAddr === trustedProxyIp) {
+      const xForwardedFor = req.headers['x-forwarded-for'];
+      if (typeof xForwardedFor === 'string') {
+        const first = xForwardedFor.split(',')[0].trim();
+        if (first) return first;
+      }
     }
   }
+
   return req.socket?.remoteAddress || 'unknown';
 }
 
@@ -525,17 +687,71 @@ function buildOpenRouterPayload({ model, maxTokens, temperature, system, user, t
   };
 }
 
+function buildHuggingFacePayload({ system, user, maxTokens, temperature }) {
+  return {
+    inputs: `${system}\n\n${user}`,
+    parameters: {
+      max_new_tokens: maxTokens,
+      temperature,
+      return_full_text: false,
+      top_p: 0.95,
+      repetition_penalty: 1.03,
+    },
+  };
+}
+
+function extractTextFromHuggingFace(data) {
+  if (typeof data === 'string') {
+    return data.trim();
+  }
+
+  if (Array.isArray(data) && data.length > 0) {
+    if (typeof data[0].generated_text === 'string') {
+      return data[0].generated_text.trim();
+    }
+    if (typeof data[0].text === 'string') {
+      return data[0].text.trim();
+    }
+  }
+
+  if (typeof data?.generated_text === 'string') {
+    return data.generated_text.trim();
+  }
+
+  if (typeof data?.text === 'string') {
+    return data.text.trim();
+  }
+
+  return '';
+}
+
+function isInsufficientCreditsError(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('insufficient credits')
+    || text.includes('never purchased credits')
+    || text.includes('quota')
+    || text.includes('402')
+    || text.includes('payment');
+}
+
+function generateMockResponse(payload = {}) {
+  return buildFallbackResponse(payload, 'Local demo AI is active because a real provider was unavailable.');
+}
+
 async function generateFromProvider(payload) {
   const { provider = DEFAULT_PROVIDER, model, apiKey, system = DEFAULT_FORGE_SYSTEM_PROMPT, user, maxTokens = 1400, temperature, trustedDomains } = payload;
   const resolvedProvider = PROVIDER_DEFAULTS[provider] ? provider : DEFAULT_PROVIDER;
   const resolvedApiKey = (apiKey || '').trim() || DEFAULT_API_KEY;
   const resolvedTemperature = Number.isFinite(Number(temperature)) ? Number(temperature) : 0.5;
+  const resolvedModel = model || DEFAULT_MODEL || PROVIDER_DEFAULTS[resolvedProvider]?.model;
+
+  if (resolvedProvider === 'mock') {
+    return generateMockResponse(payload);
+  }
 
   if (!resolvedApiKey) {
     throw new Error(providerMissingKeyMessage(resolvedProvider));
   }
-
-  const resolvedModel = model || DEFAULT_MODEL || PROVIDER_DEFAULTS[resolvedProvider]?.model;
 
   if (resolvedProvider === 'gemini') {
     const data = await providerRequest(
@@ -563,26 +779,76 @@ async function generateFromProvider(payload) {
     return extractGeminiText(data);
   }
 
-  if (resolvedProvider === 'openrouter') {
-    const data = await providerRequest('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${resolvedApiKey}`,
-        'HTTP-Referer': 'https://forge.app',
-        'X-OpenRouter-Title': 'FORGE',
-      },
-      body: JSON.stringify(buildOpenRouterPayload({
-        model: resolvedModel,
-        maxTokens,
-        temperature: resolvedTemperature,
-        system,
-        user,
-        trustedDomains,
-      })),
-    });
+  if (resolvedProvider === 'mock') {
+    return generateMockResponse(payload);
+  }
 
-    return extractTextFromProvider(resolvedProvider, data);
+  if (resolvedProvider === 'huggingface') {
+    if (!resolvedApiKey) {
+      return generateMockResponse(payload);
+    }
+
+    try {
+      const data = await providerRequest(
+        `https://api-inference.huggingface.co/models/${encodeURIComponent(resolvedModel)}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${resolvedApiKey}`,
+          },
+          body: JSON.stringify(buildHuggingFacePayload({
+            system,
+            user,
+            maxTokens,
+            temperature: resolvedTemperature,
+          })),
+        }
+      );
+
+      const text = extractTextFromHuggingFace(data);
+      return text || generateMockResponse(payload);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      if (isInsufficientCreditsError(message) || /unauthorized|forbidden|permission|quota|rate limit|not found/.test(message.toLowerCase())) {
+        return generateMockResponse(payload);
+      }
+      throw error;
+    }
+  }
+
+  if (resolvedProvider === 'openrouter') {
+    if (!resolvedApiKey) {
+      return generateMockResponse(payload);
+    }
+
+    try {
+      const data = await providerRequest('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${resolvedApiKey}`,
+          'HTTP-Referer': 'https://forge.app',
+          'X-OpenRouter-Title': 'FORGE',
+        },
+        body: JSON.stringify(buildOpenRouterPayload({
+          model: resolvedModel,
+          maxTokens,
+          temperature: resolvedTemperature,
+          system,
+          user,
+          trustedDomains,
+        })),
+      });
+
+      return extractTextFromProvider(resolvedProvider, data);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      if (isInsufficientCreditsError(message) || /unauthorized|forbidden|permission|quota|rate limit|not found/.test(message.toLowerCase())) {
+        return generateMockResponse(payload);
+      }
+      throw error;
+    }
   }
 
   const data = await providerRequest('https://api.anthropic.com/v1/messages', {
@@ -606,7 +872,14 @@ async function generateFromProvider(payload) {
 }
 
 const app = express();
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors({
+  origin: ALLOWED_ORIGIN,
+  credentials: true,
+}));
 app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+app.use('/api', createRateLimitHandler(globalRateMap, GLOBAL_RATE_LIMIT, 15 * 60 * 1000, 'Global API rate limit exceeded.'));
 
 // Security headers on every response
 app.use((_, res, next) => {
@@ -628,32 +901,125 @@ app.get('/api/health', (_, res) => {
   res.json({ status: 'ok', supabase: supabase ? 'configured' : 'not_configured' });
 });
 
-// Verify Supabase JWT token and return user info
-async function verifyAuthToken(authHeader) {
-  if (!authHeader || !authHeader.startsWith('Bearer ') || !supabase) {
-    return null;
+app.get('/api/auth/session', async (req, res) => {
+  const user = await verifyAuthToken(req);
+  res.json({ user });
+});
+
+app.post('/api/auth/login', createRateLimitHandler(authRateMap, AUTH_RATE_LIMIT, 15 * 60 * 1000, 'Too many authentication attempts. Slow down and try again.'), async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required.' });
   }
 
-  const token = authHeader.slice(7);
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-
-  if (error || !user) {
-    return null;
+  const user = await db.getUserByEmail(email);
+  if (!user || !user.password_hash || !bcrypt.compareSync(password, user.password_hash)) {
+    return res.status(401).json({ error: 'Invalid email or password.' });
   }
 
-  return {
-    id: user.id,
-    email: user.email,
-    name: user.user_metadata?.name || user.email?.split('@')[0] || '',
-  };
-}
+  const token = signJwt(user);
+  setSessionCookie(res, token);
+  res.json({ user: { id: user.id, email: user.email, name: user.name || '', provider: user.provider } });
+});
+
+app.post('/api/auth/signup', createRateLimitHandler(authRateMap, AUTH_RATE_LIMIT, 15 * 60 * 1000, 'Too many signup attempts. Slow down and try again.'), async (req, res) => {
+  const { email, password, name } = req.body || {};
+  if (!email || !password || password.length < 8) {
+    return res.status(400).json({ error: 'Provide a valid email and a password with at least 8 characters.' });
+  }
+
+  const existing = await db.getUserByEmail(email);
+  if (existing) {
+    return res.status(409).json({ error: 'Account already exists. Try logging in or continue with Google.' });
+  }
+
+  const hash = bcrypt.hashSync(password, 12);
+  const user = await db.createUser({ email, name: name || '', passwordHash: hash, provider: 'local' });
+  const token = signJwt(user);
+  setSessionCookie(res, token);
+  res.json({ user: { id: user.id, email: user.email, name: user.name || '', provider: user.provider } });
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+app.get('/api/auth/google', createRateLimitHandler(authRateMap, AUTH_RATE_LIMIT, 15 * 60 * 1000, 'Too many authentication attempts. Slow down and try again.'), (req, res) => {
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: OAUTH_REDIRECT_URI,
+    response_type: 'code',
+    scope: 'openid email profile',
+    access_type: 'offline',
+    prompt: 'select_account',
+  });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+});
+
+app.get('/api/auth/google/callback', async (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    return res.status(400).json({ error: 'Missing OAuth code.' });
+  }
+  if (!GOOGLE_CLIENT_SECRET) {
+    return res.status(500).json({ error: 'Google OAuth is not configured on the server.' });
+  }
+
+  const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code: String(code),
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri: OAUTH_REDIRECT_URI,
+      grant_type: 'authorization_code',
+    }),
+  });
+
+  const tokenData = await tokenResponse.json();
+  const accessToken = tokenData.access_token;
+  if (!accessToken) {
+    console.error('Google token error', tokenData);
+    return res.status(400).json({ error: 'Google token exchange failed.' });
+  }
+
+  const profileResponse = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  const profileData = await profileResponse.json();
+  const email = profileData.email?.toLowerCase();
+  if (!email) {
+    return res.status(400).json({ error: 'Google did not return a usable email address.' });
+  }
+
+  const user = await db.createOrUpdateGoogleUser({ email, name: profileData.name || profileData.email?.split('@')[0] || '' });
+  const token = signJwt(user);
+  setSessionCookie(res, token);
+  res.redirect(GOOGLE_REDIRECT_SUCCESS);
+});
+
+app.post('/api/waitlist/join', async (req, res) => {
+  const { email, stage } = req.body || {};
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Valid email is required.' });
+  }
+  try {
+    const data = await db.saveWaitlist(email, stage || 'Early idea');
+    res.json({ message: 'Added to the waitlist.', waitlist: data });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to join the waitlist.' });
+  }
+});
 
 app.post('/api/forge/generate', async (req, res) => {
   const payload = req.body || {};
 
   // Get user from Authorization header if present
-  const authHeader = req.headers.authorization;
-  const user = await verifyAuthToken(authHeader);
+  const user = await verifyAuthToken(req);
   const userId = user?.id || null;
 
   // Enforce per-IP per-minute rate limit
@@ -691,24 +1057,41 @@ app.post('/api/forge/generate', async (req, res) => {
     const parsed = parseStructuredResponse(text, safePayload);
 
     // If user is authenticated, save the idea to the database
-    if (user && supabase) {
-      const { error: saveError } = await supabase
-        .from('ideas')
-        .insert({
-          user_id: user.id,
-          idea_text: userInput,
-          score: parsed.score,
-          verdict: parsed.verdict,
-          strengths: parsed.strengths,
-          weaknesses: parsed.weaknesses,
-          moves: parsed.moves,
-          provider: safePayload.provider || DEFAULT_PROVIDER,
-          model: safePayload.model || DEFAULT_MODEL,
-        });
+    if (user) {
+      try {
+        if (supabase) {
+          const { error: saveError } = await supabase
+            .from('ideas')
+            .insert({
+              user_id: user.id,
+              idea_text: userInput,
+              score: parsed.score,
+              verdict: parsed.verdict,
+              strengths: parsed.strengths,
+              weaknesses: parsed.weaknesses,
+              moves: parsed.moves,
+              provider: safePayload.provider || DEFAULT_PROVIDER,
+              model: safePayload.model || DEFAULT_MODEL,
+            });
 
-      if (saveError) {
+          if (saveError) {
+            console.error('Error saving idea:', saveError);
+          }
+        } else {
+          await db.saveIdea(user.id, {
+            idea_text: userInput,
+            score: parsed.score,
+            verdict: parsed.verdict,
+            strengths: parsed.strengths,
+            weaknesses: parsed.weaknesses,
+            moves: parsed.moves,
+            provider: safePayload.provider || DEFAULT_PROVIDER,
+            model: safePayload.model || DEFAULT_MODEL,
+            tags: [],
+          });
+        }
+      } catch (saveError) {
         console.error('Error saving idea:', saveError);
-        // Continue even if save fails - don't block the user
       }
     }
 
@@ -750,38 +1133,43 @@ app.post('/api/forge/generate', async (req, res) => {
 
 // Get user's saved ideas
 app.get('/api/ideas', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  const user = await verifyAuthToken(authHeader);
+  const user = await verifyAuthToken(req);
 
   if (!user) {
     return res.status(401).json({ error: 'Authentication required' });
   }
 
-  if (!supabase) {
-    return res.status(503).json({ error: 'Database not configured' });
+  const limit = Math.min(Number(req.query.limit) || 50, 100);
+
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('ideas')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      return res.status(500).json({ error: 'Failed to fetch ideas' });
+    }
+
+    return res.json({ ideas: data });
   }
 
-  const limit = Math.min(Number(req.query.limit) || 50, 100);
-  const { data, error } = await supabase
-    .from('ideas')
-    .select('*')
-    .eq('user_id', user.id)
-    .order('created_at', { ascending: false })
-    .limit(limit);
-
-  if (error) {
+  try {
+    const ideas = await db.getIdeasByUserId(user.id, limit);
+    return res.json({ ideas });
+  } catch (error) {
+    console.error(error);
     return res.status(500).json({ error: 'Failed to fetch ideas' });
   }
-
-  res.json({ ideas: data });
 });
 
 // Update an idea (e.g., mark as favorite, add tags)
 app.patch('/api/ideas/:id', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  const user = await verifyAuthToken(authHeader);
+  const user = await verifyAuthToken(req);
 
-  if (!user || !supabase) {
+  if (!user) {
     return res.status(401).json({ error: 'Authentication required' });
   }
 
@@ -797,73 +1185,103 @@ app.patch('/api/ideas/:id', async (req, res) => {
     return res.status(400).json({ error: 'No valid updates provided' });
   }
 
-  const { data, error } = await supabase
-    .from('ideas')
-    .update(allowedUpdates)
-    .eq('id', id)
-    .eq('user_id', user.id)
-    .select()
-    .maybeSingle();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('ideas')
+      .update(allowedUpdates)
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .select()
+      .maybeSingle();
 
-  if (error || !data) {
-    return res.status(404).json({ error: 'Idea not found' });
+    if (error || !data) {
+      return res.status(404).json({ error: 'Idea not found' });
+    }
+
+    return res.json({ idea: data });
   }
 
-  res.json({ idea: data });
+  try {
+    const idea = await db.updateIdea(id, allowedUpdates, user.id);
+    if (!idea) {
+      return res.status(404).json({ error: 'Idea not found' });
+    }
+    return res.json({ idea });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Failed to update idea' });
+  }
 });
 
 // Delete an idea
 app.delete('/api/ideas/:id', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  const user = await verifyAuthToken(authHeader);
+  const user = await verifyAuthToken(req);
 
-  if (!user || !supabase) {
+  if (!user) {
     return res.status(401).json({ error: 'Authentication required' });
   }
 
   const { id } = req.params;
 
-  const { error } = await supabase
-    .from('ideas')
-    .delete()
-    .eq('id', id)
-    .eq('user_id', user.id);
+  if (supabase) {
+    const { error } = await supabase
+      .from('ideas')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', user.id);
 
-  if (error) {
-    return res.status(500).json({ error: 'Failed to delete idea' });
+    if (error) {
+      return res.status(500).json({ error: 'Failed to delete idea' });
+    }
+
+    return res.json({ ok: true });
   }
 
-  res.json({ ok: true });
+  try {
+    await db.deleteIdea(id, user.id);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Failed to delete idea' });
+  }
 });
 
 // Get user profile
 app.get('/api/profile', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  const user = await verifyAuthToken(authHeader);
+  const user = await verifyAuthToken(req);
 
-  if (!user || !supabase) {
+  if (!user) {
     return res.status(401).json({ error: 'Authentication required' });
   }
 
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('*')
-    .eq('id', user.id)
-    .maybeSingle();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', user.id)
+      .maybeSingle();
 
-  if (error) {
-    return res.status(500).json({ error: 'Failed to fetch profile' });
+    if (error) {
+      return res.status(500).json({ error: 'Failed to fetch profile' });
+    }
+
+    return res.json({ profile: data || { id: user.id, name: user.name || '' } });
   }
 
-  res.json({ profile: data || { id: user.id, name: user.name || '' } });
+  try {
+    const profile = await db.getProfile(user.id);
+    return res.json({ profile: profile || { id: user.id, name: user.name || '' } });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Failed to fetch profile' });
+  }
 });
 
 // Update user profile
 app.patch('/api/profile', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  const user = await verifyAuthToken(authHeader);
+  const user = await verifyAuthToken(req);
 
-  if (!user || !supabase) {
+  if (!user) {
     return res.status(401).json({ error: 'Authentication required' });
   }
 
@@ -878,20 +1296,32 @@ app.patch('/api/profile', async (req, res) => {
     }
   }
 
-  const { data, error } = await supabase
-    .from('profiles')
-    .upsert({ id: user.id, ...filteredUpdates })
-    .select()
-    .maybeSingle();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('profiles')
+      .upsert({ id: user.id, ...filteredUpdates })
+      .select()
+      .maybeSingle();
 
-  if (error) {
-    return res.status(500).json({ error: 'Failed to update profile' });
+    if (error) {
+      return res.status(500).json({ error: 'Failed to update profile' });
+    }
+
+    return res.json({ profile: data });
   }
 
-  res.json({ profile: data });
+  try {
+    const profile = await db.upsertProfile(user.id, filteredUpdates);
+    return res.json({ profile });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Failed to update profile' });
+  }
 });
 
 async function start() {
+  await db.initializeDatabase();
+
   if (!isProd) {
     const vite = await createViteServer({
       configFile: path.resolve(root, 'vite.config.ts'),

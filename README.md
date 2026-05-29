@@ -55,19 +55,45 @@ npm start
 
 ## Deployment
 
+### GitHub Pages
+
 ```bash
 npm run deploy
 ```
 
 This builds the app and publishes the `dist` folder to GitHub Pages.
 
+### Vercel
+
+The project already includes `api/forge/generate.js`, so Vercel can host the frontend and backend function together.
+
+1. Install or login to Vercel:
+
+```bash
+npx vercel login
+```
+
+2. Deploy to production:
+
+```bash
+npx vercel --prod
+```
+
+3. Set environment variables in the Vercel dashboard or with the CLI:
+
+- `FORGE_AI_PROVIDER=mock`
+- `FORGE_AI_MODEL=demo`
+- `FORGE_AI_API_KEY=` (leave blank for the built-in free demo provider)
+
+If you want real cloud AI instead of the local demo provider, choose `openrouter` and add a valid `FORGE_AI_API_KEY`.
+
 ## Environment variables
 
 The app uses the following vars in `.env.local`:
 
-- `FORGE_AI_PROVIDER` � default AI provider for server-side generation.
+- `FORGE_AI_PROVIDER` � default AI provider for server-side generation (`mock`, `huggingface`, `openrouter`, etc.).
 - `FORGE_AI_MODEL` � default model used by the backend.
-- `FORGE_AI_API_KEY` � provider API key used by the backend.
+- `FORGE_AI_API_KEY` � provider API key used by the backend. Leave blank for the built-in free `mock` provider.
 - `FORGE_TRUSTED_DOMAINS` � allowed research/trusted domains.
 - `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` � optional Supabase auth.
 - `VITE_POSTHOG_KEY` / `VITE_POSTHOG_HOST` � optional analytics.

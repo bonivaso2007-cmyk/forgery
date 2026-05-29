@@ -12,8 +12,8 @@ type MVPResult = {
 };
 
 const STORAGE_KEY = 'forge-mvp-state';
-const DEFAULT_PROVIDER = 'openrouter';
-const DEFAULT_OPENROUTER_MODEL = 'google/gemini-2.0-flash-001';
+const DEFAULT_PROVIDER = 'mock';
+const DEFAULT_OPENROUTER_MODEL = 'demo';
 const IGNITE_SYSTEM_PROMPT = `You are FORGE, a ruthless founder ignition engine.
 Your job is to validate the idea, not generate a generic plan.
 Return exactly one JSON object and nothing else. Do not use markdown, bullets, code fences, or extra commentary.
@@ -161,10 +161,34 @@ function parseMVPResponse(rawResponse: unknown): MVPResult {
 }
 
 export default function MVPApp() {
-  const [idea, setIdea] = useState('');
+  const [idea, setIdea] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    const saved = window.localStorage.getItem(STORAGE_KEY);
+    if (!saved) return '';
+
+    try {
+      const parsed = JSON.parse(saved);
+      return typeof parsed?.idea === 'string' ? parsed.idea : '';
+    } catch {
+      window.localStorage.removeItem(STORAGE_KEY);
+      return '';
+    }
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [result, setResult] = useState<MVPResult | null>(null);
+  const [result, setResult] = useState<MVPResult | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const saved = window.localStorage.getItem(STORAGE_KEY);
+    if (!saved) return null;
+
+    try {
+      const parsed = JSON.parse(saved);
+      return parsed?.result ?? null;
+    } catch {
+      window.localStorage.removeItem(STORAGE_KEY);
+      return null;
+    }
+  });
 
   useEffect(() => {
     captureEvent('forge_mvp_viewed');
@@ -185,23 +209,6 @@ export default function MVPApp() {
 
       identifyUser(user.id);
     });
-  }, []);
-
-  useEffect(() => {
-    const saved = window.localStorage.getItem(STORAGE_KEY);
-    if (!saved) return;
-
-    try {
-      const parsed = JSON.parse(saved);
-      if (parsed?.idea) {
-        setIdea(parsed.idea);
-      }
-      if (parsed?.result) {
-        setResult(parsed.result);
-      }
-    } catch {
-      window.localStorage.removeItem(STORAGE_KEY);
-    }
   }, []);
 
   useEffect(() => {
