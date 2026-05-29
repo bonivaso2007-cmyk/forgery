@@ -6,6 +6,11 @@ import { createServer as createViteServer } from 'vite';
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { PostHog } from 'posthog-node';
 
+// In-memory login failure tracker for brute-force protection (keyed by normalized email)
+const loginFailures = new Map();
+// Per-IP per-minute rate limiter for the generate endpoint
+const generateRateMap = new Map();
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const root = path.resolve(__dirname, '..');
@@ -194,12 +199,14 @@ function parseCookies(header = '') {
 }
 
 function getRequestIp(req) {
-  const xForwardedFor = req.headers['x-forwarded-for'];
-  if (typeof xForwardedFor === 'string') {
-    const first = xForwardedFor.split(',')[0].trim();
-    if (first) return first;
+  // Only trust X-Forwarded-For when running behind a known reverse proxy (opt-in via env)
+  if (process.env.TRUST_PROXY === 'true') {
+    const xForwardedFor = req.headers['x-forwarded-for'];
+    if (typeof xForwardedFor === 'string') {
+      const first = xForwardedFor.split(',')[0].trim();
+      if (first) return first;
+    }
   }
-
   return req.socket?.remoteAddress || 'unknown';
 }
 
@@ -265,30 +272,82 @@ function enforceUsageLimits(req, requestedTokens = 0) {
 
 function hashPassword(password) {
   const salt = randomBytes(16).toString('hex');
-  const hash = scryptSync(password, salt, 64).toString('hex');
+  // N=65536 (2^16) for stronger brute-force resistance per OWASP recommendations
+  const hash = scryptSync(password, salt, 64, { N: 65536, r: 8, p: 1 }).toString('hex');
   return { salt, hash };
 }
 
 function verifyPassword(password, salt, hash) {
-  const expected = Buffer.from(hash, 'hex');
-  const actual = Buffer.from(scryptSync(password, salt, 64).toString('hex'), 'hex');
-  if (expected.length !== actual.length) {
+  try {
+    const expected = Buffer.from(hash, 'hex');
+    // Always derive with same cost parameters; use fixed 128-byte output for timing safety
+    const derivedHex = scryptSync(password, salt, 64, { N: 65536, r: 8, p: 1 }).toString('hex');
+    const actual = Buffer.from(derivedHex, 'hex');
+    // Pad to equal length before constant-time compare to avoid length leak
+    const maxLen = Math.max(expected.length, actual.length);
+    const a = Buffer.alloc(maxLen, 0);
+    const b = Buffer.alloc(maxLen, 0);
+    expected.copy(a);
+    actual.copy(b);
+    return timingSafeEqual(a, b);
+  } catch {
     return false;
   }
-  return timingSafeEqual(expected, actual);
+}
+
+function checkBruteForce(email) {
+  const key = email.toLowerCase();
+  const now = Date.now();
+  const entry = loginFailures.get(key) || { count: 0, lockedUntil: 0 };
+  if (entry.lockedUntil > now) {
+    const remaining = Math.ceil((entry.lockedUntil - now) / 60000);
+    throw new Error(`Too many failed attempts. Try again in ${remaining} minute(s).`);
+  }
+  return entry;
+}
+
+function recordLoginFailure(email) {
+  const key = email.toLowerCase();
+  const entry = loginFailures.get(key) || { count: 0, lockedUntil: 0 };
+  entry.count += 1;
+  // Lock for 15 minutes after 5 consecutive failures
+  if (entry.count >= 5) {
+    entry.lockedUntil = Date.now() + 15 * 60 * 1000;
+    entry.count = 0;
+  }
+  loginFailures.set(key, entry);
+}
+
+function clearLoginFailures(email) {
+  loginFailures.delete(email.toLowerCase());
+}
+
+// Per-IP sliding window rate limiter: max maxRequests per windowMs
+function checkGenerateRateLimit(ip) {
+  const maxRequests = 20;
+  const windowMs = 60 * 1000;
+  const now = Date.now();
+  const timestamps = (generateRateMap.get(ip) || []).filter((t) => now - t < windowMs);
+  if (timestamps.length >= maxRequests) {
+    throw new Error('Too many requests. Slow down and try again in a moment.');
+  }
+  timestamps.push(now);
+  generateRateMap.set(ip, timestamps);
 }
 
 function setSessionCookie(res, sessionId) {
+  const secure = isProd ? '; Secure' : '';
   res.setHeader(
     'Set-Cookie',
-    `forge_session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800`
+    `forge_session=${sessionId}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800${secure}`
   );
 }
 
 function clearSessionCookie(res) {
+  const secure = isProd ? '; Secure' : '';
   res.setHeader(
     'Set-Cookie',
-    'forge_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
+    `forge_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`
   );
 }
 
@@ -569,7 +628,18 @@ async function providerRequest(url, options) {
   const text = await response.text();
 
   if (!response.ok) {
-    throw new Error(text || `HTTP ${response.status}`);
+    // Extract only a safe subset of the error — never forward raw provider errors to the client
+    let errorMsg = `Provider HTTP ${response.status}`;
+    try {
+      const errBody = JSON.parse(text);
+      const detail = errBody?.error?.message || errBody?.message || errBody?.error || '';
+      if (typeof detail === 'string' && detail.length < 300) {
+        errorMsg = detail;
+      }
+    } catch {
+      // non-JSON error body — use status only
+    }
+    throw new Error(errorMsg);
   }
 
   return text ? JSON.parse(text) : {};
@@ -681,7 +751,23 @@ async function generateFromProvider(payload) {
 }
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '100kb' }));
+
+// Security headers on every response
+app.use((_, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '0'); // Modern browsers use CSP instead
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://us.i.posthog.com; img-src 'self' data: https://images.pexels.com;"
+  );
+  if (isProd) {
+    res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
+  }
+  next();
+});
 
 app.get('/api/health', (_, res) => {
   res.json({ status: 'ok' });
@@ -691,9 +777,11 @@ app.post('/api/waitlist/join', (req, res) => {
   const { email, stage = 'Early idea' } = req.body || {};
   const normalizedEmail = String(email || '').trim().toLowerCase();
 
-  if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+  if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail) || normalizedEmail.length > 254) {
     return res.status(400).json({ error: 'Enter a valid email address.' });
   }
+
+  const safeStage = String(stage).trim().slice(0, 100) || 'Early idea';
 
   const store = loadWaitlistStore();
   const already = store.some((entry) => entry.email === normalizedEmail);
@@ -703,7 +791,7 @@ app.post('/api/waitlist/join', (req, res) => {
 
   store.push({
     email: normalizedEmail,
-    stage: String(stage).trim() || 'Early idea',
+    stage: safeStage,
     joinedAt: new Date().toISOString(),
   });
   persistWaitlistStore(store);
@@ -711,14 +799,14 @@ app.post('/api/waitlist/join', (req, res) => {
   appendAuditLog({
     type: 'waitlist_join',
     email: normalizedEmail,
-    stage: String(stage).trim() || 'Early idea',
+    stage: safeStage,
     timestamp: new Date().toISOString(),
   });
 
   posthog?.capture({
     distinctId: normalizedEmail,
     event: 'waitlist_joined',
-    properties: { stage: String(stage).trim() || 'Early idea', $set: { email: normalizedEmail } },
+    properties: { stage: safeStage, $set: { email: normalizedEmail } },
   });
 
   res.json({ ok: true, message: 'You are on the waitlist. Launch updates are on the way.' });
@@ -747,16 +835,31 @@ app.post('/api/auth/signup', (req, res) => {
   }
 
   const normalizedEmail = String(email).trim().toLowerCase();
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    return res.status(400).json({ error: 'Enter a valid email address.' });
+  }
+
+  const pw = String(password);
+  if (pw.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  }
+  if (pw.length > 128) {
+    return res.status(400).json({ error: 'Password is too long.' });
+  }
+
+  const nameStr = String(name).trim().slice(0, 64);
+
   const stores = loadStores();
 
   if (stores.users.some((entry) => entry.email === normalizedEmail)) {
     return res.status(409).json({ error: 'That email already exists. Try signing in instead.' });
   }
 
-  const record = hashPassword(String(password));
+  const record = hashPassword(pw);
   const user = {
     id: randomUUID(),
-    name: String(name).trim() || normalizedEmail.split('@')[0],
+    name: nameStr || normalizedEmail.split('@')[0],
     email: normalizedEmail,
     salt: record.salt,
     hash: record.hash,
@@ -787,13 +890,27 @@ app.post('/api/auth/login', (req, res) => {
   }
 
   const normalizedEmail = String(email).trim().toLowerCase();
+  const pw = String(password);
+
+  if (pw.length > 128) {
+    return res.status(400).json({ error: 'Invalid credentials.' });
+  }
+
+  try {
+    checkBruteForce(normalizedEmail);
+  } catch (err) {
+    return res.status(429).json({ error: err.message });
+  }
+
   const stores = loadStores();
   const user = stores.users.find((entry) => entry.email === normalizedEmail);
 
-  if (!user || !verifyPassword(String(password), user.salt, user.hash)) {
+  if (!user || !verifyPassword(pw, user.salt, user.hash)) {
+    recordLoginFailure(normalizedEmail);
     return res.status(401).json({ error: 'Email or password is wrong.' });
   }
 
+  clearLoginFailures(normalizedEmail);
   user.lastLogin = new Date().toISOString();
   persistStores(stores);
 
@@ -823,64 +940,96 @@ app.post('/api/auth/logout', (req, res) => {
 
 app.post('/api/forge/generate', async (req, res) => {
   const payload = req.body || {};
-  const tokenEstimate = estimateTokens(`${payload.system || ''}\n${payload.user || ''}`) + Number(payload.maxTokens || 1400);
+
+  // Enforce per-IP per-minute rate limit before touching usage counters
+  const ip = getRequestIp(req);
+  try {
+    checkGenerateRateLimit(ip);
+  } catch (err) {
+    return res.status(429).json({ error: err.message });
+  }
+
+  // Validate and sanitize user-supplied input fields
+  const userInput = typeof payload.user === 'string' ? payload.user.trim() : '';
+  if (!userInput) {
+    return res.status(400).json({ error: 'No idea provided.' });
+  }
+  if (userInput.length > 4000) {
+    return res.status(400).json({ error: 'Input is too long. Keep it under 4000 characters.' });
+  }
+
+  // Only forward the fields the server actually uses — never forward arbitrary payloads
+  const safePayload = {
+    provider: typeof payload.provider === 'string' ? payload.provider : undefined,
+    model: typeof payload.model === 'string' ? payload.model : undefined,
+    temperature: payload.temperature,
+    system: typeof payload.system === 'string' ? payload.system : undefined,
+    user: userInput,
+    maxTokens: typeof payload.maxTokens === 'number' ? Math.min(payload.maxTokens, 2000) : undefined,
+  };
+
+  const tokenEstimate = estimateTokens(`${safePayload.system || ''}\n${safePayload.user}`) + Number(safePayload.maxTokens || 1400);
 
   try {
     enforceUsageLimits(req, tokenEstimate);
-    const text = await generateFromProvider(payload);
-    const parsed = parseStructuredResponse(text);
+    const text = await generateFromProvider(safePayload);
+    const parsed = parseStructuredResponse(text, safePayload);
     const successUserId = getSessionUserId(req);
     appendAuditLog({
       type: 'generate',
-      ip: getRequestIp(req),
+      ip,
       userId: successUserId,
-      provider: payload.provider || DEFAULT_PROVIDER,
-      model: payload.model || DEFAULT_MODEL,
+      provider: safePayload.provider || DEFAULT_PROVIDER,
+      model: safePayload.model || DEFAULT_MODEL,
       status: 'ok',
       tokens: tokenEstimate,
       timestamp: new Date().toISOString(),
     });
     posthog?.capture({
-      distinctId: successUserId || getRequestIp(req),
+      distinctId: successUserId || ip,
       event: 'forge_generate_completed',
       properties: {
-        provider: payload.provider || DEFAULT_PROVIDER,
-        model: payload.model || DEFAULT_MODEL,
+        provider: safePayload.provider || DEFAULT_PROVIDER,
+        model: safePayload.model || DEFAULT_MODEL,
         tokens: tokenEstimate,
         authenticated: Boolean(successUserId),
       },
     });
-    res.json({ text, ...parsed });
+    // Never expose raw AI response text — only return the structured result
+    res.json(parsed);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown server error';
+    // Sanitize provider error messages before sending to client
+    const clientMessage = /api key|authentication|unauthorized|forbidden|token|secret/i.test(message)
+      ? 'AI provider error. Please try again later.'
+      : message.slice(0, 200);
     const failUserId = getSessionUserId(req);
     appendAuditLog({
       type: 'generate',
-      ip: getRequestIp(req),
+      ip,
       userId: failUserId,
-      provider: payload.provider || DEFAULT_PROVIDER,
-      model: payload.model || DEFAULT_MODEL,
+      provider: safePayload.provider || DEFAULT_PROVIDER,
+      model: safePayload.model || DEFAULT_MODEL,
       status: 'error',
-      error: message,
+      error: message.slice(0, 500),
       tokens: tokenEstimate,
       timestamp: new Date().toISOString(),
     });
     posthog?.capture({
-      distinctId: failUserId || getRequestIp(req),
+      distinctId: failUserId || ip,
       event: 'forge_generate_failed',
       properties: {
-        provider: payload.provider || DEFAULT_PROVIDER,
-        model: payload.model || DEFAULT_MODEL,
+        provider: safePayload.provider || DEFAULT_PROVIDER,
+        model: safePayload.model || DEFAULT_MODEL,
         tokens: tokenEstimate,
-        error: message,
         authenticated: Boolean(failUserId),
       },
     });
 
-    if (message.includes('limit') || message.includes('capacity') || message.includes('budget')) {
-      return res.status(429).json({ error: message });
+    if (message.includes('limit') || message.includes('capacity') || message.includes('budget') || message.includes('Too many')) {
+      return res.status(429).json({ error: clientMessage });
     }
-    res.status(500).json({ error: message });
+    res.status(500).json({ error: clientMessage });
   }
 });
 
