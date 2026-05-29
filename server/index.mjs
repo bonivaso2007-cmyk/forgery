@@ -3,24 +3,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer as createViteServer } from 'vite';
-import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createClient } from '@supabase/supabase-js';
 import { PostHog } from 'posthog-node';
-
-// In-memory login failure tracker for brute-force protection (keyed by normalized email)
-const loginFailures = new Map();
-// Per-IP per-minute rate limiter for the generate endpoint
-const generateRateMap = new Map();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const root = path.resolve(__dirname, '..');
 const isProd = process.env.NODE_ENV === 'production';
-const DATA_DIR = path.resolve(root, 'data');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
-const USAGE_FILE = path.join(DATA_DIR, 'usage.json');
-const WAITLIST_FILE = path.join(DATA_DIR, 'waitlist.json');
-const AUDIT_LOG_FILE = path.join(DATA_DIR, 'audit-log.json');
+
+// Per-IP per-minute rate limiter for the generate endpoint
+const generateRateMap = new Map();
 
 const PROVIDER_DEFAULTS = {
   gemini: {
@@ -67,6 +59,18 @@ function loadLocalEnv() {
 }
 
 loadLocalEnv();
+
+// Supabase server client (service role for admin operations)
+const supabaseUrl = process.env.VITE_SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabase = supabaseUrl && supabaseServiceKey
+  ? createClient(supabaseUrl, supabaseServiceKey, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+      },
+    })
+  : null;
 
 const posthog = process.env.POSTHOG_API_KEY
   ? new PostHog(process.env.POSTHOG_API_KEY, { host: process.env.POSTHOG_HOST || 'https://us.i.posthog.com' })
@@ -123,81 +127,6 @@ function providerMissingKeyMessage(provider) {
   return `Missing API key for ${PROVIDER_DEFAULTS[provider]?.label || provider}.`;
 }
 
-function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-}
-
-function readJson(filePath, fallback) {
-  if (!fs.existsSync(filePath)) {
-    writeJson(filePath, fallback);
-    return fallback;
-  }
-
-  try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch {
-    return fallback;
-  }
-}
-
-function writeJson(filePath, payload) {
-  ensureDataDir();
-  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2));
-}
-
-function loadStores() {
-  ensureDataDir();
-  return {
-    users: readJson(USERS_FILE, []),
-    sessions: readJson(SESSIONS_FILE, {}),
-  };
-}
-
-function persistStores(stores) {
-  writeJson(USERS_FILE, stores.users);
-  writeJson(SESSIONS_FILE, stores.sessions);
-}
-
-function loadUsageStore() {
-  return readJson(USAGE_FILE, {});
-}
-
-function persistUsageStore(store) {
-  writeJson(USAGE_FILE, store);
-}
-
-function loadWaitlistStore() {
-  return readJson(WAITLIST_FILE, []);
-}
-
-function persistWaitlistStore(store) {
-  writeJson(WAITLIST_FILE, store);
-}
-
-function loadAuditLog() {
-  return readJson(AUDIT_LOG_FILE, []);
-}
-
-function appendAuditLog(entry) {
-  const log = loadAuditLog();
-  log.push(entry);
-  writeJson(AUDIT_LOG_FILE, log.slice(-200));
-}
-
-function parseCookies(header = '') {
-  return header
-    .split(';')
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .reduce((acc, part) => {
-      const [key, ...rest] = part.split('=');
-      acc[key] = decodeURIComponent(rest.join('='));
-      return acc;
-    }, {});
-}
-
 function getRequestIp(req) {
   // Only trust X-Forwarded-For when running behind a known reverse proxy (opt-in via env)
   if (process.env.TRUST_PROXY === 'true') {
@@ -219,110 +148,16 @@ function estimateTokens(text) {
   return Math.max(1, Math.ceil(value.length / 4));
 }
 
-function getSessionUserId(req) {
-  const session = getSession(req);
-  if (!session) {
-    return null;
-  }
-
-  const stores = loadStores();
-  const user = stores.users.find((entry) => entry.id === session.userId);
-  return user?.id || null;
+// Hash IP for privacy (using SHA-256 first 16 chars)
+async function hashIp(ip) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(ip);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function enforceUsageLimits(req, requestedTokens = 0) {
-  const usageStore = loadUsageStore();
-  const dateKey = getTodayKey();
-  const bucket = usageStore[dateKey] || { global: 0, ips: {}, users: {}, tokens: 0 };
-  const ip = getRequestIp(req);
-  const userId = getSessionUserId(req);
-
-  const guestLimit = Number(process.env.FORGE_GUEST_DAILY_LIMIT || (isProd ? 2 : 100));
-  const userLimit = Number(process.env.FORGE_USER_DAILY_LIMIT || (isProd ? 30 : 500));
-  const globalLimit = Number(process.env.FORGE_GLOBAL_DAILY_LIMIT || (isProd ? 200 : 1000));
-  const globalTokenBudget = Number(process.env.FORGE_GLOBAL_TOKEN_BUDGET || (isProd ? 50000 : 500000));
-
-  if (bucket.global >= globalLimit) {
-    throw new Error('FORGE is at its daily global capacity. Try again tomorrow.');
-  }
-
-  if (bucket.tokens >= globalTokenBudget) {
-    throw new Error('FORGE reached its daily token budget. Come back tomorrow.');
-  }
-
-  if (!userId) {
-    if ((bucket.ips[ip] || 0) >= guestLimit) {
-      throw new Error('Guest forge limit reached for today. Create an account to unlock more.');
-    }
-  } else if ((bucket.users[userId] || 0) >= userLimit) {
-    throw new Error('Daily forge limit reached. Upgrade or come back tomorrow.');
-  }
-
-  bucket.global += 1;
-  bucket.tokens = (bucket.tokens || 0) + requestedTokens;
-  bucket.ips[ip] = (bucket.ips[ip] || 0) + 1;
-
-  if (userId) {
-    bucket.users[userId] = (bucket.users[userId] || 0) + 1;
-  }
-
-  usageStore[dateKey] = bucket;
-  persistUsageStore(usageStore);
-}
-
-function hashPassword(password) {
-  const salt = randomBytes(16).toString('hex');
-  // N=65536 (2^16) for stronger brute-force resistance per OWASP recommendations
-  const hash = scryptSync(password, salt, 64, { N: 65536, r: 8, p: 1 }).toString('hex');
-  return { salt, hash };
-}
-
-function verifyPassword(password, salt, hash) {
-  try {
-    const expected = Buffer.from(hash, 'hex');
-    // Always derive with same cost parameters; use fixed 128-byte output for timing safety
-    const derivedHex = scryptSync(password, salt, 64, { N: 65536, r: 8, p: 1 }).toString('hex');
-    const actual = Buffer.from(derivedHex, 'hex');
-    // Pad to equal length before constant-time compare to avoid length leak
-    const maxLen = Math.max(expected.length, actual.length);
-    const a = Buffer.alloc(maxLen, 0);
-    const b = Buffer.alloc(maxLen, 0);
-    expected.copy(a);
-    actual.copy(b);
-    return timingSafeEqual(a, b);
-  } catch {
-    return false;
-  }
-}
-
-function checkBruteForce(email) {
-  const key = email.toLowerCase();
-  const now = Date.now();
-  const entry = loginFailures.get(key) || { count: 0, lockedUntil: 0 };
-  if (entry.lockedUntil > now) {
-    const remaining = Math.ceil((entry.lockedUntil - now) / 60000);
-    throw new Error(`Too many failed attempts. Try again in ${remaining} minute(s).`);
-  }
-  return entry;
-}
-
-function recordLoginFailure(email) {
-  const key = email.toLowerCase();
-  const entry = loginFailures.get(key) || { count: 0, lockedUntil: 0 };
-  entry.count += 1;
-  // Lock for 15 minutes after 5 consecutive failures
-  if (entry.count >= 5) {
-    entry.lockedUntil = Date.now() + 15 * 60 * 1000;
-    entry.count = 0;
-  }
-  loginFailures.set(key, entry);
-}
-
-function clearLoginFailures(email) {
-  loginFailures.delete(email.toLowerCase());
-}
-
-// Per-IP sliding window rate limiter: max maxRequests per windowMs
+// Per-IP sliding window rate limiter
 function checkGenerateRateLimit(ip) {
   const maxRequests = 20;
   const windowMs = 60 * 1000;
@@ -335,69 +170,88 @@ function checkGenerateRateLimit(ip) {
   generateRateMap.set(ip, timestamps);
 }
 
-function setSessionCookie(res, sessionId) {
-  const secure = isProd ? '; Secure' : '';
-  res.setHeader(
-    'Set-Cookie',
-    `forge_session=${sessionId}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800${secure}`
-  );
-}
-
-function clearSessionCookie(res) {
-  const secure = isProd ? '; Secure' : '';
-  res.setHeader(
-    'Set-Cookie',
-    `forge_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`
-  );
-}
-
-function createSession(userId) {
-  const stores = loadStores();
-  const sessionId = randomUUID();
-  stores.sessions[sessionId] = {
-    userId,
-    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
-  };
-  persistStores(stores);
-  return sessionId;
-}
-
-function getSession(req) {
-  const cookieHeader = req.headers.cookie || '';
-  const cookies = parseCookies(cookieHeader);
-  const sessionId = cookies.forge_session;
-  if (!sessionId) {
-    return null;
+// Enforce usage limits using Supabase database
+async function enforceUsageLimits(req, userId, requestedTokens = 0) {
+  if (!supabase) {
+    console.warn('Supabase not configured - skipping usage limits');
+    return;
   }
 
-  const stores = loadStores();
-  const session = stores.sessions[sessionId];
-  if (!session) {
-    return null;
+  const ip = getRequestIp(req);
+  const ipHash = await hashIp(ip);
+  const dateKey = getTodayKey();
+
+  const guestLimit = Number(process.env.FORGE_GUEST_DAILY_LIMIT || (isProd ? 5 : 100));
+  const userLimit = Number(process.env.FORGE_USER_DAILY_LIMIT || (isProd ? 50 : 500));
+  const globalLimit = Number(process.env.FORGE_GLOBAL_DAILY_LIMIT || (isProd ? 500 : 2000));
+
+  // Check global limit (aggregate all usage for today)
+  const { data: globalUsage, error: globalError } = await supabase
+    .from('usage_logs')
+    .select('request_count, token_count')
+    .eq('date_key', dateKey);
+
+  if (globalError) {
+    console.error('Error checking global usage:', globalError);
   }
 
-  if (session.expiresAt <= Date.now()) {
-    delete stores.sessions[sessionId];
-    persistStores(stores);
-    return null;
+  const totalRequests = (globalUsage || []).reduce((sum, r) => sum + (r.request_count || 0), 0);
+  const totalTokens = (globalUsage || []).reduce((sum, r) => sum + (r.token_count || 0), 0);
+
+  if (totalRequests >= globalLimit) {
+    throw new Error('FORGE is at its daily global capacity. Try again tomorrow.');
   }
 
-  return { sessionId, ...session };
-}
+  if (!userId) {
+    // Guest user - check by IP hash
+    const { data: guestUsage, error: guestError } = await supabase
+      .from('usage_logs')
+      .select('request_count')
+      .eq('ip_hash', ipHash)
+      .eq('date_key', dateKey);
 
-function serializeUser(user) {
-  return {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    lastLogin: user.lastLogin || user.createdAt || null,
-  };
-}
+    if (guestError) {
+      console.error('Error checking guest usage:', guestError);
+    }
 
-function extractGeminiText(data) {
-  const candidate = data?.candidates?.[0];
-  const parts = candidate?.content?.parts || [];
-  return parts.map((part) => part.text || '').join('').trim();
+    const guestRequests = (guestUsage || []).reduce((sum, r) => sum + (r.request_count || 0), 0);
+    if (guestRequests >= guestLimit) {
+      throw new Error('Guest forge limit reached for today. Create a free account to unlock more.');
+    }
+  } else {
+    // Authenticated user - check by user ID
+    const { data: userUsage, error: userError } = await supabase
+      .from('usage_logs')
+      .select('request_count')
+      .eq('user_id', userId)
+      .eq('date_key', dateKey);
+
+    if (userError) {
+      console.error('Error checking user usage:', userError);
+    }
+
+    const userRequests = (userUsage || []).reduce((sum, r) => sum + (r.request_count || 0), 0);
+    if (userRequests >= userLimit) {
+      throw new Error('Daily forge limit reached. Upgrade or come back tomorrow.');
+    }
+  }
+
+  // Log this usage
+  const { error: insertError } = await supabase
+    .from('usage_logs')
+    .insert({
+      user_id: userId || null,
+      ip_hash: ipHash,
+      date_key: dateKey,
+      request_count: 1,
+      token_count: requestedTokens,
+      provider: DEFAULT_PROVIDER,
+      model: DEFAULT_MODEL,
+    });
+
+  if (insertError) {
+    console.error('Error logging usage:', insertError);
+  }
 }
 
 function cleanStructuredText(value) {
@@ -524,26 +378,28 @@ function extractStructuredSectionsFromText(text) {
   });
 }
 
+function extractGeminiText(data) {
+  const candidate = data?.candidates?.[0];
+  const parts = candidate?.content?.parts || [];
+  return parts.map((part) => part.text || '').join('').trim();
+}
+
 function extractTextFromProvider(provider, data) {
   if (provider === 'gemini') {
     return extractGeminiText(data);
   }
 
   if (provider === 'openrouter') {
-    // Prioritize actual message content over internal thinking/reasoning chain
     let content = data?.choices?.[0]?.message?.content || data?.choices?.[0]?.delta?.content || '';
-    
-    // If content is empty but reasoning is present, we can use it as fallback,
-    // though normally we want content.
+
     if (!content && data?.choices?.[0]?.message?.reasoning) {
       content = data.choices[0].message.reasoning;
     }
-    
-    // Strip <think>...</think> reasoning monologues if they are embedded in the content
+
     if (typeof content === 'string') {
       content = content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
     }
-    
+
     return content;
   }
 
@@ -628,7 +484,6 @@ async function providerRequest(url, options) {
   const text = await response.text();
 
   if (!response.ok) {
-    // Extract only a safe subset of the error — never forward raw provider errors to the client
     let errorMsg = `Provider HTTP ${response.status}`;
     try {
       const errBody = JSON.parse(text);
@@ -637,7 +492,7 @@ async function providerRequest(url, options) {
         errorMsg = detail;
       }
     } catch {
-      // non-JSON error body — use status only
+      // non-JSON error body
     }
     throw new Error(errorMsg);
   }
@@ -714,7 +569,7 @@ async function generateFromProvider(payload) {
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${resolvedApiKey}`,
-        'HTTP-Referer': 'https://forge.local',
+        'HTTP-Referer': 'https://forge.app',
         'X-OpenRouter-Title': 'FORGE',
       },
       body: JSON.stringify(buildOpenRouterPayload({
@@ -757,11 +612,11 @@ app.use(express.json({ limit: '100kb' }));
 app.use((_, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-XSS-Protection', '0'); // Modern browsers use CSP instead
+  res.setHeader('X-XSS-Protection', '0');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader(
     'Content-Security-Policy',
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://us.i.posthog.com; img-src 'self' data: https://images.pexels.com;"
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://*.supabase.co https://us.i.posthog.com https://openrouter.ai https://api.anthropic.com https://generativelanguage.googleapis.com; img-src 'self' data: https://images.pexels.com https://lh3.googleusercontent.com;"
   );
   if (isProd) {
     res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
@@ -770,178 +625,38 @@ app.use((_, res, next) => {
 });
 
 app.get('/api/health', (_, res) => {
-  res.json({ status: 'ok' });
+  res.json({ status: 'ok', supabase: supabase ? 'configured' : 'not_configured' });
 });
 
-app.post('/api/waitlist/join', (req, res) => {
-  const { email, stage = 'Early idea' } = req.body || {};
-  const normalizedEmail = String(email || '').trim().toLowerCase();
-
-  if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail) || normalizedEmail.length > 254) {
-    return res.status(400).json({ error: 'Enter a valid email address.' });
+// Verify Supabase JWT token and return user info
+async function verifyAuthToken(authHeader) {
+  if (!authHeader || !authHeader.startsWith('Bearer ') || !supabase) {
+    return null;
   }
 
-  const safeStage = String(stage).trim().slice(0, 100) || 'Early idea';
+  const token = authHeader.slice(7);
+  const { data: { user }, error } = await supabase.auth.getUser(token);
 
-  const store = loadWaitlistStore();
-  const already = store.some((entry) => entry.email === normalizedEmail);
-  if (already) {
-    return res.json({ ok: true, message: 'You are already on the list.' });
+  if (error || !user) {
+    return null;
   }
 
-  store.push({
-    email: normalizedEmail,
-    stage: safeStage,
-    joinedAt: new Date().toISOString(),
-  });
-  persistWaitlistStore(store);
-
-  appendAuditLog({
-    type: 'waitlist_join',
-    email: normalizedEmail,
-    stage: safeStage,
-    timestamp: new Date().toISOString(),
-  });
-
-  posthog?.capture({
-    distinctId: normalizedEmail,
-    event: 'waitlist_joined',
-    properties: { stage: safeStage, $set: { email: normalizedEmail } },
-  });
-
-  res.json({ ok: true, message: 'You are on the waitlist. Launch updates are on the way.' });
-});
-
-app.get('/api/auth/session', (req, res) => {
-  const session = getSession(req);
-  if (!session) {
-    return res.status(401).json({ error: 'Not authenticated' });
-  }
-
-  const stores = loadStores();
-  const user = stores.users.find((entry) => entry.id === session.userId);
-  if (!user) {
-    return res.status(401).json({ error: 'Not authenticated' });
-  }
-
-  res.json({ user: serializeUser(user) });
-});
-
-app.post('/api/auth/signup', (req, res) => {
-  const { email, password, name = '' } = req.body || {};
-
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required.' });
-  }
-
-  const normalizedEmail = String(email).trim().toLowerCase();
-
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
-    return res.status(400).json({ error: 'Enter a valid email address.' });
-  }
-
-  const pw = String(password);
-  if (pw.length < 8) {
-    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
-  }
-  if (pw.length > 128) {
-    return res.status(400).json({ error: 'Password is too long.' });
-  }
-
-  const nameStr = String(name).trim().slice(0, 64);
-
-  const stores = loadStores();
-
-  if (stores.users.some((entry) => entry.email === normalizedEmail)) {
-    return res.status(409).json({ error: 'That email already exists. Try signing in instead.' });
-  }
-
-  const record = hashPassword(pw);
-  const user = {
-    id: randomUUID(),
-    name: nameStr || normalizedEmail.split('@')[0],
-    email: normalizedEmail,
-    salt: record.salt,
-    hash: record.hash,
-    createdAt: new Date().toISOString(),
-    lastLogin: new Date().toISOString(),
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.user_metadata?.name || user.email?.split('@')[0] || '',
   };
-
-  stores.users.push(user);
-  persistStores(stores);
-
-  const sessionId = createSession(user.id);
-  setSessionCookie(res, sessionId);
-
-  posthog?.capture({
-    distinctId: user.id,
-    event: 'user_signed_up',
-    properties: { name: user.name, $set: { email: user.email, name: user.name } },
-  });
-
-  res.json({ user: serializeUser(user) });
-});
-
-app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body || {};
-
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required.' });
-  }
-
-  const normalizedEmail = String(email).trim().toLowerCase();
-  const pw = String(password);
-
-  if (pw.length > 128) {
-    return res.status(400).json({ error: 'Invalid credentials.' });
-  }
-
-  try {
-    checkBruteForce(normalizedEmail);
-  } catch (err) {
-    return res.status(429).json({ error: err.message });
-  }
-
-  const stores = loadStores();
-  const user = stores.users.find((entry) => entry.email === normalizedEmail);
-
-  if (!user || !verifyPassword(pw, user.salt, user.hash)) {
-    recordLoginFailure(normalizedEmail);
-    return res.status(401).json({ error: 'Email or password is wrong.' });
-  }
-
-  clearLoginFailures(normalizedEmail);
-  user.lastLogin = new Date().toISOString();
-  persistStores(stores);
-
-  const sessionId = createSession(user.id);
-  setSessionCookie(res, sessionId);
-
-  posthog?.capture({
-    distinctId: user.id,
-    event: 'user_logged_in',
-    properties: { $set: { email: user.email, name: user.name } },
-  });
-
-  res.json({ user: serializeUser(user) });
-});
-
-app.post('/api/auth/logout', (req, res) => {
-  const session = getSession(req);
-  if (session) {
-    const stores = loadStores();
-    delete stores.sessions[session.sessionId];
-    persistStores(stores);
-  }
-
-  clearSessionCookie(res);
-  res.json({ ok: true });
-});
+}
 
 app.post('/api/forge/generate', async (req, res) => {
   const payload = req.body || {};
 
-  // Enforce per-IP per-minute rate limit before touching usage counters
+  // Get user from Authorization header if present
+  const authHeader = req.headers.authorization;
+  const user = await verifyAuthToken(authHeader);
+  const userId = user?.id || null;
+
+  // Enforce per-IP per-minute rate limit
   const ip = getRequestIp(req);
   try {
     checkGenerateRateLimit(ip);
@@ -958,7 +673,7 @@ app.post('/api/forge/generate', async (req, res) => {
     return res.status(400).json({ error: 'Input is too long. Keep it under 4000 characters.' });
   }
 
-  // Only forward the fields the server actually uses — never forward arbitrary payloads
+  // Only forward the fields the server actually uses
   const safePayload = {
     provider: typeof payload.provider === 'string' ? payload.provider : undefined,
     model: typeof payload.model === 'string' ? payload.model : undefined,
@@ -971,58 +686,58 @@ app.post('/api/forge/generate', async (req, res) => {
   const tokenEstimate = estimateTokens(`${safePayload.system || ''}\n${safePayload.user}`) + Number(safePayload.maxTokens || 1400);
 
   try {
-    enforceUsageLimits(req, tokenEstimate);
+    await enforceUsageLimits(req, userId, tokenEstimate);
     const text = await generateFromProvider(safePayload);
     const parsed = parseStructuredResponse(text, safePayload);
-    const successUserId = getSessionUserId(req);
-    appendAuditLog({
-      type: 'generate',
-      ip,
-      userId: successUserId,
-      provider: safePayload.provider || DEFAULT_PROVIDER,
-      model: safePayload.model || DEFAULT_MODEL,
-      status: 'ok',
-      tokens: tokenEstimate,
-      timestamp: new Date().toISOString(),
-    });
+
+    // If user is authenticated, save the idea to the database
+    if (user && supabase) {
+      const { error: saveError } = await supabase
+        .from('ideas')
+        .insert({
+          user_id: user.id,
+          idea_text: userInput,
+          score: parsed.score,
+          verdict: parsed.verdict,
+          strengths: parsed.strengths,
+          weaknesses: parsed.weaknesses,
+          moves: parsed.moves,
+          provider: safePayload.provider || DEFAULT_PROVIDER,
+          model: safePayload.model || DEFAULT_MODEL,
+        });
+
+      if (saveError) {
+        console.error('Error saving idea:', saveError);
+        // Continue even if save fails - don't block the user
+      }
+    }
+
     posthog?.capture({
-      distinctId: successUserId || ip,
+      distinctId: userId || ip,
       event: 'forge_generate_completed',
       properties: {
         provider: safePayload.provider || DEFAULT_PROVIDER,
         model: safePayload.model || DEFAULT_MODEL,
         tokens: tokenEstimate,
-        authenticated: Boolean(successUserId),
+        authenticated: Boolean(userId),
       },
     });
-    // Never expose raw AI response text — only return the structured result
+
     res.json(parsed);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown server error';
-    // Sanitize provider error messages before sending to client
     const clientMessage = /api key|authentication|unauthorized|forbidden|token|secret/i.test(message)
       ? 'AI provider error. Please try again later.'
       : message.slice(0, 200);
-    const failUserId = getSessionUserId(req);
-    appendAuditLog({
-      type: 'generate',
-      ip,
-      userId: failUserId,
-      provider: safePayload.provider || DEFAULT_PROVIDER,
-      model: safePayload.model || DEFAULT_MODEL,
-      status: 'error',
-      error: message.slice(0, 500),
-      tokens: tokenEstimate,
-      timestamp: new Date().toISOString(),
-    });
+
     posthog?.capture({
-      distinctId: failUserId || ip,
+      distinctId: userId || ip,
       event: 'forge_generate_failed',
       properties: {
         provider: safePayload.provider || DEFAULT_PROVIDER,
         model: safePayload.model || DEFAULT_MODEL,
         tokens: tokenEstimate,
-        authenticated: Boolean(failUserId),
+        authenticated: Boolean(userId),
       },
     });
 
@@ -1031,6 +746,149 @@ app.post('/api/forge/generate', async (req, res) => {
     }
     res.status(500).json({ error: clientMessage });
   }
+});
+
+// Get user's saved ideas
+app.get('/api/ideas', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const user = await verifyAuthToken(authHeader);
+
+  if (!user) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  if (!supabase) {
+    return res.status(503).json({ error: 'Database not configured' });
+  }
+
+  const limit = Math.min(Number(req.query.limit) || 50, 100);
+  const { data, error } = await supabase
+    .from('ideas')
+    .select('*')
+    .eq('user_id', user.id)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    return res.status(500).json({ error: 'Failed to fetch ideas' });
+  }
+
+  res.json({ ideas: data });
+});
+
+// Update an idea (e.g., mark as favorite, add tags)
+app.patch('/api/ideas/:id', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const user = await verifyAuthToken(authHeader);
+
+  if (!user || !supabase) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  const { id } = req.params;
+  const updates = req.body || {};
+
+  // Only allow specific fields to be updated
+  const allowedUpdates = {};
+  if (typeof updates.is_favorite === 'boolean') allowedUpdates.is_favorite = updates.is_favorite;
+  if (Array.isArray(updates.tags)) allowedUpdates.tags = updates.tags;
+
+  if (Object.keys(allowedUpdates).length === 0) {
+    return res.status(400).json({ error: 'No valid updates provided' });
+  }
+
+  const { data, error } = await supabase
+    .from('ideas')
+    .update(allowedUpdates)
+    .eq('id', id)
+    .eq('user_id', user.id)
+    .select()
+    .maybeSingle();
+
+  if (error || !data) {
+    return res.status(404).json({ error: 'Idea not found' });
+  }
+
+  res.json({ idea: data });
+});
+
+// Delete an idea
+app.delete('/api/ideas/:id', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const user = await verifyAuthToken(authHeader);
+
+  if (!user || !supabase) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  const { id } = req.params;
+
+  const { error } = await supabase
+    .from('ideas')
+    .delete()
+    .eq('id', id)
+    .eq('user_id', user.id);
+
+  if (error) {
+    return res.status(500).json({ error: 'Failed to delete idea' });
+  }
+
+  res.json({ ok: true });
+});
+
+// Get user profile
+app.get('/api/profile', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const user = await verifyAuthToken(authHeader);
+
+  if (!user || !supabase) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  if (error) {
+    return res.status(500).json({ error: 'Failed to fetch profile' });
+  }
+
+  res.json({ profile: data || { id: user.id, name: user.name || '' } });
+});
+
+// Update user profile
+app.patch('/api/profile', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const user = await verifyAuthToken(authHeader);
+
+  if (!user || !supabase) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  const updates = req.body || {};
+
+  // Only allow specific fields
+  const allowedFields = ['name', 'stage', 'geo', 'customer', 'problem', 'solution', 'market', 'revenue', 'channels', 'constraints', 'strengths', 'risks', 'goals'];
+  const filteredUpdates = {};
+  for (const field of allowedFields) {
+    if (typeof updates[field] === 'string') {
+      filteredUpdates[field] = updates[field].slice(0, 2000);
+    }
+  }
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .upsert({ id: user.id, ...filteredUpdates })
+    .select()
+    .maybeSingle();
+
+  if (error) {
+    return res.status(500).json({ error: 'Failed to update profile' });
+  }
+
+  res.json({ profile: data });
 });
 
 async function start() {
@@ -1059,6 +917,7 @@ async function start() {
 
   app.listen(port, host, () => {
     console.log(`FORGE server listening on http://${host}:${port}`);
+    console.log(`Supabase: ${supabase ? 'configured' : 'not configured'}`);
   });
 }
 

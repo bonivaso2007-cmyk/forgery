@@ -173,7 +173,7 @@ export default function MVPApp() {
       return;
     }
 
-    void getCurrentSessionUser().then((user) => {
+    void getCurrentSessionUser().then((user: { id: string; email?: string } | null) => {
       if (!user) {
         return;
       }
