@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { Analytics } from "@vercel/analytics/react";
 import "./App.css";
 
 const Q_TARGET = 6;
@@ -2847,6 +2848,7 @@ export default function Forge() {
           )}
 
           <div style={{ height: "5rem" }} />
+        <Analytics />
         </div>
       </div>
     </div>
