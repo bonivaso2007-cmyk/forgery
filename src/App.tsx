@@ -45,11 +45,18 @@ const PROVIDERS = {
     path: "/api/mock/v1",
   },
   huggingface: {
-    label: "Hugging Face",
+    label: "Hugging Face (Inference API)",
     keyLabel: "Hugging Face API key",
     keyExample: "hf_...",
-    model: "deepseek/deepseek-v4-pro",
+    model: "deepseek-ai/DeepSeek-V4-Pro",
     path: "/api/huggingface/v1",
+  },
+  huggingface_router: {
+    label: "Hugging Face Router (OpenAI API)",
+    keyLabel: "Hugging Face API key",
+    keyExample: "hf_...",
+    model: "deepseek-ai/DeepSeek-R1:novita",
+    path: "/api/forge/generate",
   },
   openrouter: {
     label: "OpenRouter",
@@ -508,9 +515,22 @@ async function callForgeAPI(payload) {
     throw new Error(`HTTP ${res.status}${text ? `: ${text}` : ""}`);
   }
 
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    const body = await res.text();
+    throw new Error(`Expected JSON response but got ${contentType}: ${body.slice(0, 250)}`);
+  }
+
   const data = await res.json();
-  if (!data?.text) throw new Error("Empty response");
-  return data.text;
+  // Server returns structured { score, verdict, strengths, weaknesses, moves }
+  // For question generation, the verdict IS the question text
+  // For output generation, convert to JSON string for parsing
+  if (!data || typeof data !== 'object') throw new Error("Empty response");
+  
+  // Extract the text content: verdict is the primary text field
+  const text = data.text || data.verdict || JSON.stringify(data);
+  if (!text) throw new Error("Empty response");
+  return text;
 }
 
 async function aiStream(system, user, onChunk, maxTok = 1400, apiKey = "", provider = DEFAULT_PROVIDER, model = "") {

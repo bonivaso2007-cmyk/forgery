@@ -1,6 +1,7 @@
 const DEFAULT_MODEL = 'demo';
-const DEFAULT_HUGGINGFACE_MODEL = 'deepseek/deepseek-v4-pro';
-const DEFAULT_PROVIDER = 'mock';
+const DEFAULT_HUGGINGFACE_MODEL = 'deepseek-ai/DeepSeek-V4-Pro';
+const DEFAULT_HF_API_KEY = process.env.HF_TOKEN?.trim() || '';
+const DEFAULT_PROVIDER = process.env.FORGE_AI_PROVIDER || (DEFAULT_HF_API_KEY ? 'huggingface_router' : 'mock');
 const DEFAULT_FORGE_SYSTEM_PROMPT = `You are FORGE, a ruthless founder decision engine.
 Return exactly one JSON object and nothing else. Do not use markdown, bullets, code fences, or extra commentary.
 Use this schema:
@@ -283,6 +284,32 @@ function buildHuggingFacePayload({ system, user, maxTokens, temperature }) {
   };
 }
 
+async function generateFromHuggingFaceRouter({ model, apiKey, system, user, maxTokens, temperature }) {
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${apiKey}`,
+  };
+
+  const body = {
+    model: model || 'deepseek-ai/DeepSeek-R1:novita',
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+    max_tokens: maxTokens,
+    temperature: temperature ?? 0.5,
+    stream: false,
+  };
+
+  const data = await providerRequest('https://router.huggingface.co/v1/chat/completions', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  return data?.choices?.[0]?.message?.content || '';
+}
+
 function extractTextFromHuggingFace(data) {
   if (typeof data === 'string') {
     return data.trim();
@@ -320,7 +347,15 @@ async function providerRequest(url, options) {
     throw new Error(rawText || `HTTP ${response.status}`);
   }
 
-  return rawText ? JSON.parse(rawText) : {};
+  if (!rawText) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    return rawText;
+  }
 }
 
 async function generateFromProvider(payload) {
@@ -335,11 +370,13 @@ async function generateFromProvider(payload) {
     trustedDomains,
   } = payload;
 
-  const resolvedProvider = ['mock', 'huggingface', 'openrouter'].includes(provider) ? provider : DEFAULT_PROVIDER;
+  const resolvedProvider = ['mock', 'huggingface', 'huggingface_router', 'openrouter'].includes(provider) ? provider : DEFAULT_PROVIDER;
   const resolvedModel = model || (resolvedProvider === 'huggingface'
     ? DEFAULT_HUGGINGFACE_MODEL
-    : 'deepseek/deepseek-v4-flash:free');
-  const resolvedApiKey = (apiKey || '').trim() || process.env.FORGE_AI_API_KEY?.trim();
+    : resolvedProvider === 'huggingface_router'
+      ? 'deepseek-ai/DeepSeek-R1:novita'
+      : 'deepseek/deepseek-v4-flash:free');
+  const resolvedApiKey = (apiKey || '').trim() || process.env.FORGE_AI_API_KEY?.trim() || DEFAULT_HF_API_KEY;
   const resolvedTemperature = Number.isFinite(Number(temperature)) ? Number(temperature) : 0.5;
 
   if (resolvedProvider === 'mock') {
@@ -373,6 +410,36 @@ async function generateFromProvider(payload) {
       }
 
       return generateMockResponse(payload);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      if (isInsufficientCreditsError(message) || /unauthorized|forbidden|permission|quota|rate limit|not found/.test(message.toLowerCase())) {
+        if (resolvedApiKey) {
+          return generateFromHuggingFaceRouter({
+            model: 'deepseek-ai/DeepSeek-R1:novita',
+            apiKey: resolvedApiKey,
+            system,
+            user,
+            maxTokens,
+            temperature: resolvedTemperature,
+          });
+        }
+        return generateMockResponse(payload);
+      }
+      throw error;
+    }
+  }
+
+  if (resolvedProvider === 'huggingface_router') {
+    try {
+      const text = await generateFromHuggingFaceRouter({
+        model: resolvedModel,
+        apiKey: resolvedApiKey,
+        system,
+        user,
+        maxTokens,
+        temperature: resolvedTemperature,
+      });
+      return text || generateMockResponse(payload);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error || '');
       if (isInsufficientCreditsError(message) || /unauthorized|forbidden|permission|quota|rate limit|not found/.test(message.toLowerCase())) {

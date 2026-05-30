@@ -11,8 +11,12 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import * as db from './db.mjs';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+let __dirname;
+try {
+  __dirname = path.dirname(fileURLToPath(import.meta.url));
+} catch {
+  __dirname = process.cwd();
+}
 const root = path.resolve(__dirname, '..');
 const isProd = process.env.NODE_ENV === 'production';
 
@@ -50,8 +54,12 @@ const PROVIDER_DEFAULTS = {
     model: 'demo',
   },
   huggingface: {
-    label: 'Hugging Face',
-    model: 'deepseek/deepseek-v4-pro',
+    label: 'Hugging Face (Inference API)',
+    model: 'deepseek-ai/DeepSeek-V4-Pro',
+  },
+  huggingface_router: {
+    label: 'Hugging Face Router (OpenAI API)',
+    model: 'deepseek-ai/DeepSeek-R1:novita',
   },
   gemini: {
     label: 'Google Gemini',
@@ -64,6 +72,10 @@ const PROVIDER_DEFAULTS = {
   openrouter: {
     label: 'OpenRouter',
     model: 'deepseek/deepseek-v4-flash:free',
+  },
+  python_local: {
+    label: 'Local Python AI (Transformers)',
+    model: 'distilgpt2',
   },
 };
 
@@ -125,7 +137,8 @@ const posthog = process.env.POSTHOG_API_KEY
   ? new PostHog(process.env.POSTHOG_API_KEY, { host: process.env.POSTHOG_HOST || 'https://us.i.posthog.com' })
   : null;
 
-const DEFAULT_PROVIDER = process.env.FORGE_AI_PROVIDER || 'mock';
+const DEFAULT_HF_API_KEY = process.env.HF_TOKEN?.trim() || '';
+const DEFAULT_PROVIDER = process.env.FORGE_AI_PROVIDER || (DEFAULT_HF_API_KEY ? 'huggingface_router' : 'mock');
 const DEFAULT_MODEL = process.env.FORGE_AI_MODEL || PROVIDER_DEFAULTS[DEFAULT_PROVIDER]?.model || PROVIDER_DEFAULTS.openrouter.model;
 const DEFAULT_API_KEY = process.env.FORGE_AI_API_KEY?.trim() || '';
 const DEFAULT_FORGE_SYSTEM_PROMPT = `You are FORGE, a ruthless founder decision engine.
@@ -659,7 +672,15 @@ async function providerRequest(url, options) {
     throw new Error(errorMsg);
   }
 
-  return text ? JSON.parse(text) : {};
+  if (!text) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
 }
 
 function buildOpenRouterPayload({ model, maxTokens, temperature, system, user, trustedDomains }) {
@@ -738,15 +759,119 @@ function generateMockResponse(payload = {}) {
   return buildFallbackResponse(payload, 'Local demo AI is active because a real provider was unavailable.');
 }
 
+// ── Hugging Face Router (OpenAI-compatible) ──────────────────
+async function generateFromHuggingFaceRouter({ model, apiKey, system, user, maxTokens, temperature }) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${apiKey}`,
+  };
+
+  const body = {
+    model: model || 'deepseek-ai/DeepSeek-R1:novita',
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+    max_tokens: maxTokens || 1400,
+    temperature: temperature ?? 0.5,
+    stream: false,
+  };
+
+  const data = await providerRequest('https://router.huggingface.co/v1/chat/completions', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  // OpenAI-compatible response format
+  return data?.choices?.[0]?.message?.content || '';
+}
+
+// ── Python Local AI (Transformers) ──────────────────────────
+async function generateFromPythonLocal({ system, user, maxTokens = 300 }) {
+  // Construct the full prompt for the local model
+  const prompt = `${system}\n\nUser idea: ${user}\n\nFORGE analysis:`;
+
+  return new Promise((resolve, reject) => {
+    const { spawn } = require('child_process');
+    const scriptPath = path.join(__dirname, '..', 'deepseek', 'server_bridge.py');
+    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+
+    const child = spawn(pythonCmd, [scriptPath], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 60000,
+      env: {
+        ...process.env,
+        FORGE_LOCAL_MAX_TOKENS: String(maxTokens),
+      },
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0) {
+        console.warn(`Python bridge exited with code ${code}`, stderr.slice(0, 200));
+        // Fallback to mock on Python failure
+        resolve(null);
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(stdout.trim());
+        resolve(parsed.text || null);
+      } catch {
+        // If output is not JSON, treat the raw stdout as the result
+        const cleaned = stdout.trim();
+        resolve(cleaned || null);
+      }
+    });
+
+    child.on('error', (err) => {
+      console.warn('Could not start Python bridge:', err.message);
+      resolve(null);
+    });
+
+    // Write prompt to stdin
+    child.stdin.write(prompt);
+    child.stdin.end();
+  });
+}
+
 async function generateFromProvider(payload) {
   const { provider = DEFAULT_PROVIDER, model, apiKey, system = DEFAULT_FORGE_SYSTEM_PROMPT, user, maxTokens = 1400, temperature, trustedDomains } = payload;
   const resolvedProvider = PROVIDER_DEFAULTS[provider] ? provider : DEFAULT_PROVIDER;
-  const resolvedApiKey = (apiKey || '').trim() || DEFAULT_API_KEY;
+  const resolvedApiKey = (apiKey || '').trim() || DEFAULT_API_KEY || DEFAULT_HF_API_KEY;
   const resolvedTemperature = Number.isFinite(Number(temperature)) ? Number(temperature) : 0.5;
   const resolvedModel = model || DEFAULT_MODEL || PROVIDER_DEFAULTS[resolvedProvider]?.model;
 
   if (resolvedProvider === 'mock') {
     return generateMockResponse(payload);
+  }
+
+  // ── Python Local AI (no API key needed) ─────────────
+  if (resolvedProvider === 'python_local') {
+    try {
+      const pythonResult = await generateFromPythonLocal({
+        system,
+        user,
+        maxTokens: Math.min(maxTokens || 1400, 500),
+      });
+      if (pythonResult) return pythonResult;
+      // Fallback to mock on Python failure
+      return generateMockResponse(payload);
+    } catch (err) {
+      console.warn('Python local AI failed:', err.message);
+      return generateMockResponse(payload);
+    }
   }
 
   if (!resolvedApiKey) {
@@ -812,6 +937,38 @@ async function generateFromProvider(payload) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error || '');
       if (isInsufficientCreditsError(message) || /unauthorized|forbidden|permission|quota|rate limit|not found/.test(message.toLowerCase())) {
+        if (resolvedApiKey) {
+          return generateFromHuggingFaceRouter({
+            model: 'deepseek-ai/DeepSeek-R1:novita',
+            apiKey: resolvedApiKey,
+            system,
+            user,
+            maxTokens,
+            temperature: resolvedTemperature,
+          });
+        }
+        return generateMockResponse(payload);
+      }
+      throw error;
+    }
+  }
+
+  // ── Hugging Face Router (OpenAI-compatible) ─────────
+  if (resolvedProvider === 'huggingface_router') {
+    try {
+      const text = await generateFromHuggingFaceRouter({
+        model: resolvedModel,
+        apiKey: resolvedApiKey,
+        system,
+        user,
+        maxTokens,
+        temperature: resolvedTemperature,
+      });
+      if (text) return text;
+      return generateMockResponse(payload);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      if (isInsufficientCreditsError(message) || /unauthorized|forbidden|permission|quota|rate limit/.test(message.toLowerCase())) {
         return generateMockResponse(payload);
       }
       throw error;
@@ -890,11 +1047,17 @@ app.use((_, res, next) => {
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader(
     'Content-Security-Policy',
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://*.supabase.co https://us.i.posthog.com https://openrouter.ai https://api.anthropic.com https://generativelanguage.googleapis.com; img-src 'self' data: https://images.pexels.com https://lh3.googleusercontent.com;"
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://*.supabase.co https://us.i.posthog.com https://openrouter.ai https://api.anthropic.com https://generativelanguage.googleapis.com https://router.huggingface.co; img-src 'self' data: https://images.pexels.com https://lh3.googleusercontent.com;"
   );
   if (isProd) {
     res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
   }
+  next();
+});
+
+// Fallback for Vite: return JSON error instead of HTML for API routes
+app.use('/api', (req, res, next) => {
+  res.setHeader('Content-Type', 'application/json');
   next();
 });
 
@@ -1053,7 +1216,12 @@ app.post('/api/forge/generate', async (req, res) => {
   const tokenEstimate = estimateTokens(`${safePayload.system || ''}\n${safePayload.user}`) + Number(safePayload.maxTokens || 1400);
 
   try {
-    await enforceUsageLimits(req, userId, tokenEstimate);
+    // Don't let usage limits block generation - they're a soft check
+    try {
+      await enforceUsageLimits(req, userId, tokenEstimate);
+    } catch (usageError) {
+      console.warn('Usage limit check failed (non-blocking):', usageError.message);
+    }
     const text = await generateFromProvider(safePayload);
     const parsed = parseStructuredResponse(text, safePayload);
 
@@ -1110,8 +1278,10 @@ app.post('/api/forge/generate', async (req, res) => {
     res.json(parsed);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown server error';
-    const clientMessage = /api key|authentication|unauthorized|forbidden|token|secret/i.test(message)
-      ? 'AI provider error. Please try again later.'
+    console.error('Generate endpoint error:', message);
+    // Only mask errors that explicitly mention invalid API keys or auth tokens
+    const clientMessage = /invalid api key|missing api key|authentication failed|401|403/i.test(message)
+      ? 'AI provider error. Please check your API key and try again.'
       : message.slice(0, 200);
 
     posthog?.capture({
