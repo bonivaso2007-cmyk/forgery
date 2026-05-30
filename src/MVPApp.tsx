@@ -12,7 +12,7 @@ type MVPResult = {
 };
 
 const STORAGE_KEY = 'forge-mvp-state';
-const DEFAULT_PROVIDER = 'mock';
+const DEFAULT_PROVIDER = 'huggingface_router';
 const DEFAULT_OPENROUTER_MODEL = 'demo';
 const IGNITE_SYSTEM_PROMPT = `You are FORGE, a ruthless founder ignition engine.
 Your job is to validate the idea, not generate a generic plan.

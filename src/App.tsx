@@ -12,7 +12,7 @@ const TEXT_MUTED = "#d7d7d7";
 const TEXT_DIM = "#b8b8b8";
 const TEXT_SOFT = "#8f8f8f";
 const BRANCH_COLORS = [LIME, ORANGE, CYAN, PINK, PURPLE, "#00FFB2"];
-const DEFAULT_PROVIDER = "mock";
+const DEFAULT_PROVIDER = "huggingface_router";
 const OPENROUTER_DEFAULT_MODEL = "deepseek/deepseek-v4-flash:free";
 const OPENROUTER_MODELS = [
   { label: "DeepSeek v4 Flash (free)", value: "deepseek/deepseek-v4-flash:free" },
